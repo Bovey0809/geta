@@ -1370,7 +1370,7 @@ class Graph:
             if param_name in node_group.param_names:
                 node_groups.append(node_group)
         return node_groups
-
+    
     def compute_flops(self, in_million=True, in_billion=False):
         """
         Compute the number of floating point operations (FLOPs) for the graph.
@@ -1389,16 +1389,74 @@ class Graph:
         flops_break_down["total"] = 0
         flops_break_down["by_node_groups"] = dict()
         flops_break_down["by_nodes"] = dict()
+        
+        # Track FLOPs by operator type
+        flops_by_type = {}
+        
         for node_group in self.node_groups.values():
             flops_break_down["by_node_groups"][node_group.id] = 0
-
-            for node in node_group:
-                cur_flops = node.op.compute_flops(node.input_shape[0])
-                cur_flops = _scale_value(cur_flops, in_million, in_billion)
-                flops_break_down["by_node_groups"][node_group.id] += cur_flops
-                flops_break_down["by_nodes"][node.id] = cur_flops
-                flops_break_down["total"] += cur_flops
+            
+            # Check if this is a composed operator (like Attention)
+            is_composed_node_group = type(node_group).__name__ == "NodeGroupComposedOp"
+            
+            if is_composed_node_group:
+                # Get first node
+                first_node = None
+                for node in node_group:
+                    first_node = node
+                    break
+                
+                # Use output_shape (like compute_macs does)
+                if first_node and first_node.output_shape and len(first_node.output_shape) > 0:
+                    # Call the COMPOSED operator's compute_flops with output_shape
+                    cur_flops = node_group.op.compute_flops(first_node.output_shape)
+                    cur_flops = _scale_value(cur_flops, in_million, in_billion)
+                    flops_break_down["by_node_groups"][node_group.id] = cur_flops
+                    
+                    # Track by type
+                    op_type = type(node_group.op).__name__
+                    if op_type not in flops_by_type:
+                        flops_by_type[op_type] = 0
+                    flops_by_type[op_type] += cur_flops
+                    
+                    # Assign to all nodes in the group
+                    for node in node_group:
+                        flops_break_down["by_nodes"][node.id] = cur_flops / max(sum(1 for _ in node_group), 1)
+                    flops_break_down["total"] += cur_flops
+                else:
+                    # Still track the operator type with 0 FLOPs
+                    op_type = type(node_group.op).__name__
+                    if op_type not in flops_by_type:
+                        flops_by_type[op_type] = 0
+            else:
+                # For basic operators, compute per node
+                for node in node_group:
+                    if not node.input_shape or len(node.input_shape) == 0:
+                        cur_flops = 0
+                    else:
+                        cur_flops = node.op.compute_flops(node.input_shape[0])
+                    
+                    cur_flops = _scale_value(cur_flops, in_million, in_billion)
+                    flops_break_down["by_node_groups"][node_group.id] += cur_flops
+                    flops_break_down["by_nodes"][node.id] = cur_flops
+                    flops_break_down["total"] += cur_flops
+                    
+                    # Track by type
+                    op_type = type(node.op).__name__
+                    if op_type not in flops_by_type:
+                        flops_by_type[op_type] = 0
+                    flops_by_type[op_type] += cur_flops
+        
+        # Print breakdown
+        print("\n=== FLOPs Breakdown by Operator Type ===")
+        for op_type, flops in sorted(flops_by_type.items(), key=lambda x: -x[1]):
+            pct = (flops / flops_break_down["total"] * 100) if flops_break_down["total"] > 0 else 0
+            print(f"{op_type:30s}: {flops:10.2f}M ({pct:5.2f}%)")
+        print(f"{'Total':30s}: {flops_break_down['total']:10.2f}M (100.00%)")
+        print("=" * 60 + "\n")
+        
         return flops_break_down
+    
 
     def print_layer_breakdown(
         self, macs_info: Dict[str, List[Dict]], bops_info: Dict[str, List[Dict]]
@@ -1423,6 +1481,7 @@ class Graph:
         print(f"Total MACs: {total_macs:.2f} M")
         print(f"Total BOPs: {total_bops:.2f} M")
 
+    
     def compute_macs(self, in_million=True, in_billion=False, layerwise=False):
         """
         Computes the Multiply-Accumulate Operations (MACs) for the graph.
@@ -1452,12 +1511,16 @@ class Graph:
             macs_break_down["layer_info"] = []
 
         for node_group in self.node_groups.values():
-            cur_macs_temp = 0
             macs_break_down["by_node_groups"][node_group.id] = 0
 
             is_composed_node_group = type(node_group).__name__ == "NodeGroupComposedOp"
             for node in node_group:
-                if not is_composed_node_group:
+                cur_macs = 0
+                
+                # Skip nodes without valid output shape
+                if not node.output_shape or len(node.output_shape) == 0:
+                    cur_macs = 0
+                elif not is_composed_node_group:
                     if type(node.op).__name__ not in ["BertAttentionOTO"]:
                         cur_macs = node.op.compute_macs(node.output_shape)
                 else:
@@ -1465,10 +1528,9 @@ class Graph:
                         cur_macs = node.leaf_op.compute_macs(node.output_shape)
                     else:
                         cur_macs = node.op.compute_macs(node.output_shape)
+                
                 cur_macs = _scale_value(cur_macs, in_million, in_billion)
-                macs_break_down["by_node_groups"][node_group.id] += (
-                    cur_macs + cur_macs_temp
-                )
+                macs_break_down["by_node_groups"][node_group.id] += cur_macs
                 macs_break_down["by_nodes"][node.id] = cur_macs
                 macs_break_down["total"] += cur_macs
                 if layerwise:
@@ -1509,32 +1571,58 @@ class Graph:
             bops_break_down["by_node_groups"][node_group.id] = 0
 
             is_composed_node_group = type(node_group).__name__ == "NodeGroupComposedOp"
-            for node in node_group:
-                if not is_composed_node_group:
-                    if type(node.op).__name__ not in ["BertAttentionOTO"]:
+            
+            if is_composed_node_group:
+                # For composed operators, compute BOPs ONCE at group level
+                first_node = None
+                for node in node_group:
+                    first_node = node
+                    break
+                
+                # Use output_shape (like compute_flops)
+                if first_node and first_node.output_shape and len(first_node.output_shape) > 0:
+                    cur_macs = node_group.op.compute_macs(first_node.output_shape)
+                    cur_bops = node_group.op.compute_bops(cur_macs)
+                    cur_bops = _scale_value(cur_bops, in_million, in_billion)
+                    bops_break_down["by_node_groups"][node_group.id] = cur_bops
+                    
+                    for node in node_group:
+                        node_bops = cur_bops / max(sum(1 for _ in node_group), 1)
+                        bops_break_down["by_nodes"][node.id] = node_bops
+                        if layerwise:
+                            bops_break_down["layer_info"].append(
+                                {
+                                    "name": node.id,
+                                    "type": node.op_name,
+                                    "weight_bitwidth": node_group.op.weight_bit,
+                                    "activation_bitwidth": node_group.op.activation_bit,
+                                    "bops": node_bops,
+                                }
+                            )
+                    bops_break_down["total"] += cur_bops
+            else:
+                # Basic operators - compute per node
+                for node in node_group:
+                    cur_bops = 0
+                    if node.output_shape and len(node.output_shape) > 0:
                         cur_macs = node.op.compute_macs(node.output_shape)
                         cur_bops = node.op.compute_bops(cur_macs)
-                else:
-                    if node.leaf_op is not None:
-                        cur_macs = node.leaf_op.compute_macs(node.output_shape)
-                        cur_bops = node.leaf_op.compute_bops(cur_macs)
-                    else:
-                        cur_macs = node.op.compute_macs(node.output_shape)
-                        cur_bops = node.op.compute_bops(cur_macs)
-                cur_bops = _scale_value(cur_bops, in_million, in_billion)
-                bops_break_down["by_node_groups"][node_group.id] += cur_bops
-                bops_break_down["by_nodes"][node.id] = cur_bops
-                bops_break_down["total"] += cur_bops
-                if layerwise:
-                    bops_break_down["layer_info"].append(
-                        {
-                            "name": node.id,
-                            "type": node.op_name,
-                            "weight_bitwidth": node.op.weight_bit,
-                            "activation_bitwidth": node.op.activation_bit,
-                            "bops": cur_bops,
-                        }
-                    )
+                    
+                    cur_bops = _scale_value(cur_bops, in_million, in_billion)
+                    bops_break_down["by_node_groups"][node_group.id] += cur_bops
+                    bops_break_down["by_nodes"][node.id] = cur_bops
+                    bops_break_down["total"] += cur_bops
+                    if layerwise:
+                        bops_break_down["layer_info"].append(
+                            {
+                                "name": node.id,
+                                "type": node.op_name,
+                                "weight_bitwidth": node.op.weight_bit,
+                                "activation_bitwidth": node.op.activation_bit,
+                                "bops": cur_bops,
+                            }
+                        )
+        
         return bops_break_down
 
     def compute_num_params(self, in_million=True, in_billion=False):

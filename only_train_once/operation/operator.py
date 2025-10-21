@@ -506,10 +506,10 @@ class LinearOTO(Operator):
             flops *= dim
         flops *= self.module.out_features
         return flops
-
+    
     def compute_macs(self, output_shape=None):
-        batch_size = 1 if output_shape is None else output_shape[0]
-        seq_len = 1 if len(output_shape) == 2 else output_shape[1]
+        batch_size = 1 if (output_shape is None or len(output_shape) == 0) else output_shape[0]
+        seq_len = 1 if (output_shape is None or len(output_shape) < 2) else output_shape[1]
         out_features = self.module.out_features
         in_features = self.module.in_features
         return batch_size * seq_len * out_features * in_features
@@ -974,40 +974,6 @@ class BaseMultiHeadAttentionOTO(Operator):
                     leaf_op.prune_in_dim(pruned_idxes, param_names=[param_name])
                 visited_modules.add(module_name)
 
-    """
-    def compute_flops(self, input_tensor_shape):
-        if isinstance(input_tensor_shape, (int, float)) or (isinstance(input_tensor_shape, (list, tuple)) and len(input_tensor_shape) == 1):
-            # Scalar parameter or single-element tensor
-            # we assume one operation (e.g., multiplication) per scalar
-            return 1
-        
-        if not isinstance(input_tensor_shape, (list, tuple)):
-            raise ValueError(f"Unexpected input_tensor_shape: {input_tensor_shape}")
-        
-        if len(input_tensor_shape) != 3:
-            raise ValueError(f"Expected 3D input shape (batch_size, seq_len, hidden_size), got: {input_tensor_shape}")
-        
-        # flops for Q, K, V projections
-        batch_size, seq_len, hidden_size = input_tensor_shape
-        # flops = 3 * batch_size * seq_len * hidden_size * hidden_size
-        # flops for attention scores and weights
-        score_flops = batch_size * self.num_heads * seq_len * seq_len * self.head_dim
-        weight_flops = batch_size * self.num_heads * seq_len * seq_len * self.head_dim
-        # flops for output projection
-        # output_flops = batch_size * seq_len * hidden_size * hidden_size
-        # total_flops = flops + score_flops + weight_flops + output_flops
-        total_flops = score_flops + weight_flops
-        return total_flops
-
-    def compute_macs(self, input_shape):
-        # placholder
-        return self.compute_flops(input_shape) // 2
-
-    def compute_bops(self, input_tensor_shape, weight_bit=32, activation_bit=32):
-        macs = self.compute_macs(input_tensor_shape)
-        return macs * weight_bit * activation_bit
-    """
-
 
 class LlamaAttentionOTO(BaseMultiHeadAttentionOTO):
     def __init__(self, id=None, _type=None, cfg_params=dict(), module=None):
@@ -1400,6 +1366,176 @@ class QuantizeConv2dOTO(Conv2dOTO):
         return param_groups
 
 
+class E2TTSAttentionOTO(BaseMultiHeadAttentionOTO):
+    """Operator for E2TTS Attention module."""
+    
+    def __init__(self, id=None, _type=None, cfg_params=dict(), module=None):
+        super().__init__(id, _type, cfg_params, module)
+        self.out_key = "to_out"
+        self.op_name = "e2tts_attention"
+        self.set_attributes()
+
+    def set_attributes(self):
+        """Extract attributes from E2TTS Attention module."""
+        self.num_heads = self.module.heads
+        self.head_dim = self.module.dim_head
+        
+        if self.prune_mode == "head_dim":
+            self.num_groups = self.head_dim
+        elif self.prune_mode == "num_head":
+            self.num_groups = self.num_heads
+        
+        self.hidden_size = self.num_heads * self.head_dim
+        self.num_group_divisible = 2
+    
+    def set_num_groups(self):
+        """Override to prevent base class from overwriting num_groups."""
+        # num_groups is already set correctly in set_attributes()
+        pass
+    
+    def get_param_groups(self, param_names=list(), skip_output_node=False, **kwargs):
+        """Get parameter groups with correct num_groups."""
+        param_groups = super().get_param_groups(param_names, skip_output_node, **kwargs)
+        
+        # Ensure correct values (override any inference)
+        param_groups["num_groups"] = self.num_groups
+        param_groups["num_heads"] = self.num_heads  
+        param_groups["head_dim"] = self.head_dim
+        
+        return param_groups
+    
+    def prune_out_dim_num_head(
+    self, pruned_idxes=list(), param_names=list(), skip_output_node=True, **kwargs
+):
+        """Prune entire attention heads."""
+        visited_modules = set()
+        
+        if len(param_names) > 0:
+            # Prune specific parameters by name
+            for param_name in param_names:
+                for module_name in self.leaf_modules:
+                    if not param_name.startswith(module_name):
+                        continue
+                    leaf_op = self.leaf_modules[module_name]
+                    if module_name not in visited_modules:
+                        leaf_op.prune_out_dim(pruned_idxes, param_names=[param_name])
+                    visited_modules.add(module_name)
+        
+        elif len(param_names) == 0 and skip_output_node:
+            preserved_idxes = list(set(range(self.num_groups)) - set(pruned_idxes))
+            preserved_idxes.sort()
+            
+            # Update module's head count
+            self.module.heads = self.num_groups - len(pruned_idxes)
+            
+            # Update attend instance if it exists
+            if hasattr(self.module, 'attend') and self.module.attend is not None:
+                self.module.attend.heads = self.module.heads
+            
+            # Expand pruned head indices to dimension indices
+            expand_pruned_idxes = list()
+            for i in pruned_idxes:
+                for h in range(self.head_dim):
+                    expand_pruned_idxes.append(h + i * self.head_dim)
+            
+            # Prune Q, K, V projections (output dimension)
+            for module_name in self.leaf_modules:
+                if self.out_key in module_name:
+                    continue  # Skip output projection
+                leaf_op = self.leaf_modules[module_name]
+                leaf_op.prune_out_dim(expand_pruned_idxes)
+            
+            # Prune output projection INPUT dimension to match pruned Q/K/V
+            for module_name in self.leaf_modules:
+                if self.out_key in module_name:
+                    leaf_op = self.leaf_modules[module_name]
+                    leaf_op.prune_in_dim(expand_pruned_idxes)
+                    break
+    def prune_out_dim_num_head(
+    self, pruned_idxes=list(), param_names=list(), skip_output_node=True, **kwargs
+):
+        """Prune entire attention heads."""
+        visited_modules = set()
+        
+        if len(param_names) > 0:
+            # Prune specific parameters by name
+            for param_name in param_names:
+                for module_name in self.leaf_modules:
+                    if not param_name.startswith(module_name):
+                        continue
+                    leaf_op = self.leaf_modules[module_name]
+                    if module_name not in visited_modules:
+                        leaf_op.prune_out_dim(pruned_idxes, param_names=[param_name])
+                    visited_modules.add(module_name)
+        
+        elif len(param_names) == 0 and skip_output_node:
+            preserved_idxes = list(set(range(self.num_groups)) - set(pruned_idxes))
+            preserved_idxes.sort()
+            self.module.heads = self.num_groups - len(pruned_idxes)
+            
+            # Update operator's own attributes for compute_flops/macs/bops
+            self.num_heads = self.module.heads
+            self.num_groups = self.num_heads
+            self.hidden_size = self.num_heads * self.head_dim
+            
+            # Update attend instance if it exists
+            if hasattr(self.module, 'attend') and self.module.attend is not None:
+                self.module.attend.heads = self.module.heads
+            
+            # Expand pruned head indices to dimension indices
+            expand_pruned_idxes = list()
+            for i in pruned_idxes:
+                for h in range(self.head_dim):
+                    expand_pruned_idxes.append(h + i * self.head_dim)
+            
+            # Prune Q, K, V projections (output dimension)
+            for module_name in self.leaf_modules:
+                if self.out_key in module_name:
+                    continue
+                leaf_op = self.leaf_modules[module_name]
+                leaf_op.prune_out_dim(expand_pruned_idxes)
+            
+            # Prune output projection INPUT dimension
+            for module_name in self.leaf_modules:
+                if self.out_key in module_name:
+                    leaf_op = self.leaf_modules[module_name]
+                    leaf_op.prune_in_dim(expand_pruned_idxes)
+                    break
+    
+
+    def compute_flops(self, input_tensor_shape):
+        """Compute FLOPs for attention operation."""
+        if not input_tensor_shape or len(input_tensor_shape) < 2:
+            return 0
+        
+        # Handle both [batch, seq, hidden] and [seq, hidden]
+        if len(input_tensor_shape) == 2:
+            batch_size = 1
+            seq_len, hidden_size = input_tensor_shape
+        else:  # len >= 3
+            batch_size, seq_len, hidden_size = input_tensor_shape[0], input_tensor_shape[1], input_tensor_shape[2]
+        # Q, K, V projections
+        qkv_flops = 3 * batch_size * seq_len * hidden_size * self.num_heads * self.head_dim
+        # Attention computation (QK^T + softmax(QK^T)V)
+        attn_flops = 2 * batch_size * self.num_heads * seq_len * seq_len * self.head_dim=
+        # Output projection
+        out_flops = batch_size * seq_len * self.num_heads * self.head_dim * hidden_size
+        
+        return qkv_flops + attn_flops + out_flops
+
+    def compute_macs(self, output_shape):
+        """MACs are approximately half of FLOPs."""
+        if not output_shape or len(output_shape) < 2:
+            return 0
+        return self.compute_flops(output_shape) // 2
+
+    def compute_bops(self, macs, weight_bit=None, activation_bit=None):
+        """Compute BOPs from MACs."""
+        if weight_bit is not None and activation_bit is not None:
+            return macs * weight_bit * activation_bit
+        else:
+            return macs * self.weight_bit * self.activation_bit
+
 BASIC_MODULES = {
     "ConvTranspose2d": ConvTranspose2dOTO,
     "Conv2d": Conv2dOTO,
@@ -1435,6 +1571,8 @@ COMPOSED_MODULES = {
     # SAM
     "SamTwoWayAttentionBlock": SamTwoWayAttentionBlockOTO,
     "SamVisionAttention": SamVisionAttentionOTO,
+    # E2TTS
+    "Attention": E2TTSAttentionOTO,
 }
 
 # Unsupported e=yet or unprunable Operators

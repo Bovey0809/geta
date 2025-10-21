@@ -119,6 +119,7 @@ class BasicNodeGroup(ABC):
     def merge(self, node_group):
         self.add_nodes(node_group.nodes.values())
         
+
 class NodeGroup(BasicNodeGroup):
     def __init__(self, is_prunable=True):
         super().__init__(is_prunable)
@@ -211,8 +212,10 @@ class NodeGroup(BasicNodeGroup):
             norm_group = torch.sqrt(norm_group)
             norm_group = norm_group.cpu()
 
-            self.pruning_important_idxes = np.arange(self.num_groups)[norm_group != 0]
-            self.pruning_redundant_idxes = np.arange(self.num_groups)[norm_group == 0]
+            # FIX: Use param_groups['num_groups'] to get the correct value
+            num_groups = param_groups.get('num_groups', self.num_groups)
+            self.pruning_important_idxes = np.arange(num_groups)[norm_group != 0]
+            self.pruning_redundant_idxes = np.arange(num_groups)[norm_group == 0]
 
             # TODO: index list transformation
             if hasattr(self, 'overwrite_p_transform'):
@@ -252,7 +255,6 @@ class NodeGroup(BasicNodeGroup):
             else:
                 self.pruning_redundant_idxes = list()
             self.pruning_important_idxes = list()
-
 
         for (param, p_transform, node_id) in zip(param_groups['params'], param_groups['p_transform'], param_groups['node_ids']):
             if p_transform == TensorTransform.NO_PRUNE:
@@ -334,6 +336,7 @@ class NodeGroup(BasicNodeGroup):
             self.is_auxiliary = False
             return False
         
+
 class NodeGroupComposedOp(BasicNodeGroup):
     """
     NodeGroupComposedOp refers to the node group for a composed operator
@@ -427,13 +430,16 @@ class NodeGroupComposedOp(BasicNodeGroup):
         # Skip the output node params, which should depend on other node groups
         op_param_group = self.op.get_param_groups(skip_output_node=True)
         basic_attrs = ['op_names', 'p_names', 'params', 'p_transform']
+        # FIX: Add protected_attrs to prevent num_groups from being overwritten
+        protected_attrs = ['num_groups']
+        
         ng_param_group['op_names'].extend([op_param_group['op']] * len(op_param_group['params']))
         ng_param_group['p_names'].extend(op_param_group['p_names'])
         ng_param_group['params'].extend(op_param_group['params'])
         ng_param_group['p_transform'].extend(op_param_group['p_transform'])
         
         for attr in op_param_group:
-            if attr not in basic_attrs:
+            if attr not in basic_attrs and attr not in protected_attrs:
                 ng_param_group[attr] = op_param_group[attr]
 
         for attr in self.extra_param_group_attrs:
@@ -480,12 +486,15 @@ class NodeGroupComposedOp(BasicNodeGroup):
                     norm_group += torch.norm(param_transform, dim=1) ** 2
             norm_group = torch.sqrt(norm_group)
             norm_group = norm_group.cpu()
-            if self.num_groups == 1:
+            
+            # FIX: Use param_groups value if available
+            num_groups = param_groups.get('num_groups', self.num_groups)
+            if num_groups == 1:
                 self.pruning_important_idxes = np.arange(1)
                 self.pruning_redundant_idxes = []
             else:
-                self.pruning_important_idxes = np.arange(self.num_groups)[norm_group != 0]
-                self.pruning_redundant_idxes = np.arange(self.num_groups)[norm_group == 0]
+                self.pruning_important_idxes = np.arange(num_groups)[norm_group != 0]
+                self.pruning_redundant_idxes = np.arange(num_groups)[norm_group == 0]
                                     
     def prune_out_dim(self, **kwargs):
         if hasattr(self.op, 'prune_out_dim'):
