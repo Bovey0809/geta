@@ -342,6 +342,36 @@ def post_process_depthtospace_node(graph):
                 (conv_node_before.op.p_transform, {'num_groups': conv_node_before.op.num_groups})
             ]
             node_group.is_prunable = True
+            
+def merge_attention_node_groups(graph):
+    """Merge all E2TTS Attention node groups so they prune together."""
+    attention_node_groups = []
+    
+    # Collect all E2TTS Attention node groups
+    for node_group_id, node_group in list(graph.node_groups.items()):
+        if type(node_group).__name__ == 'NodeGroupComposedOp':
+            if hasattr(node_group, 'op') and type(node_group.op).__name__ == 'E2TTSAttentionOTO':
+                attention_node_groups.append((node_group_id, node_group))
+    
+    if len(attention_node_groups) <= 1:
+        print(f"Found {len(attention_node_groups)} attention layer(s), no merging needed")
+        return
+    
+    print(f"Merging {len(attention_node_groups)} E2TTS Attention node groups into one")
+    
+    # Merge all into the first one
+    first_id, merged_group = attention_node_groups[0]
+    for node_group_id, node_group in attention_node_groups[1:]:
+        merged_group.merge(node_group)
+        # Remove from graph.node_groups
+        del graph.node_groups[node_group_id]
+    
+    # Re-register the merged group with new ID
+    del graph.node_groups[first_id]
+    graph.node_groups[merged_group.id] = merged_group
+    
+    print(f"Merged attention group ID: {merged_group.id}")
+    print(f"Total nodes in merged group: {merged_group.num_nodes()}")
 
 
 def build_pruning_dependency_graph(graph):    
@@ -383,6 +413,8 @@ def build_pruning_dependency_graph(graph):
 
     # Setp 9: Merge Basic Node Group into Composed Node Group if being a subset
     merge_basic_composed_node_groups(graph)
+
+    merge_attention_node_groups(graph) 
     
     # Step 10: Set prunable for node_group
     for node_group in graph.node_groups.values():

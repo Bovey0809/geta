@@ -1,6 +1,36 @@
 import torch
 import os
 
+
+def fix_attention_heads_after_pruning(model):
+    """Fix Attention.heads attributes based on actual pruned weight shapes."""
+    for name, module in model.named_modules():
+        if type(module).__name__ == 'Attention':
+            # Infer actual heads from to_q weight shape
+            if hasattr(module, 'to_q'):
+                to_q_module = module.to_q
+                # Handle both Linear and QuantizeLinear
+                if hasattr(to_q_module, 'weight'):
+                    actual_dim = to_q_module.weight.shape[0]
+                    actual_heads = actual_dim // module.dim_head
+                    if actual_heads != module.heads:
+                        print(f"Fixing {name}: heads {module.heads} -> {actual_heads}")
+                        module.heads = actual_heads
+                        if hasattr(module, 'attend') and module.attend is not None:
+                            module.attend.heads = actual_heads
+        
+        # Fix ALiBi
+        if type(module).__name__ == 'AlibiPositionalBias':
+            actual_slopes = module.slopes.shape[0]
+            if hasattr(module, '_pruned_total_heads'):
+                # Already fixed
+                continue
+            if actual_slopes != module.total_heads:
+                print(f"Fixing ALiBi: heads {module.total_heads} -> {actual_slopes}")
+                module.heads = actual_slopes
+                module.total_heads = actual_slopes
+                module.bias = None
+
 def automated_pruning_compression(oto_graph, model, merge_lora_to_base, unmerge_lora_to_base, export_huggingface_format, export_float16, \
                           full_group_sparse_model_dir, compressed_model_dir, save_full_group_sparse_model, ckpt_format):
     full_group_spase_model_name = None
@@ -184,6 +214,8 @@ def automated_pruning_compression(oto_graph, model, merge_lora_to_base, unmerge_
     if unmerge_lora_to_base:
         if hasattr(model, 'unmerge_and_unload'):
             model = model.unmerge_and_unload()
+    
+    fix_attention_heads_after_pruning(model)
             
     if export_huggingface_format:
         model.save_pretrained(compressed_model_path)

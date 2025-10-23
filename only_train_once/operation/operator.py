@@ -1371,6 +1371,7 @@ class E2TTSAttentionOTO(BaseMultiHeadAttentionOTO):
     
     def __init__(self, id=None, _type=None, cfg_params=dict(), module=None):
         super().__init__(id, _type, cfg_params, module)
+        self.root_model = cfg_params.get('root_model', None) 
         self.out_key = "to_out"
         self.op_name = "e2tts_attention"
         self.set_attributes()
@@ -1394,7 +1395,7 @@ class E2TTSAttentionOTO(BaseMultiHeadAttentionOTO):
         pass
     
     def get_param_groups(self, param_names=list(), skip_output_node=False, **kwargs):
-        """Get parameter groups with correct num_groups."""
+        """Get parameter groups with correct num_groups ."""
         param_groups = super().get_param_groups(param_names, skip_output_node, **kwargs)
         
         # Ensure correct values (override any inference)
@@ -1403,84 +1404,100 @@ class E2TTSAttentionOTO(BaseMultiHeadAttentionOTO):
         param_groups["head_dim"] = self.head_dim
         
         return param_groups
+
+    def _update_shared_alibi(self, preserved_idxes):
+        """Update shared ALiBi once (called by first attention layer in merged group)."""
+        if self.root_model is None:
+            print("Warning: Cannot update ALiBi - no root model reference")
+            return False
+        
+        for name, parent_module in self.root_model.named_modules():
+            if type(parent_module).__name__ not in ['AttentionLayers', 'Encoder']:
+                continue
+                
+            if not (hasattr(parent_module, 'layers') and hasattr(parent_module, 'rel_pos')):
+                continue
+            
+            alibi = parent_module.rel_pos
+            if alibi is None:
+                continue
+            
+            target_heads = len(preserved_idxes)
+            
+            # Check if already at target size (skip entire update)
+            if alibi.slopes.shape[0] == target_heads:
+                print(f"ALiBi already at {target_heads} heads, skipping update")
+                # Still register buffers if not already done
+                if not hasattr(alibi, '_pruned_heads'):
+                    alibi.register_buffer('_pruned_heads', torch.tensor(target_heads, dtype=torch.long), persistent=True)
+                    alibi.register_buffer('_pruned_total_heads', torch.tensor(target_heads, dtype=torch.long), persistent=True)
+                    alibi.heads = target_heads
+                    alibi.total_heads = target_heads
+                return True
+            
+            print(f"Updating shared ALiBi: {alibi.slopes.shape[0]} -> {target_heads} heads")
+            print(f"Preserved head indices: {preserved_idxes}")
+            
+            # Only select slopes if we have enough (haven't been pruned yet)
+            if alibi.slopes.shape[0] >= max(preserved_idxes) + 1:
+                preserved_slopes = alibi.slopes[preserved_idxes]
+                alibi.slopes.data = preserved_slopes.contiguous()
+            else:
+                print(f"WARNING: ALiBi already pruned, cannot select from original indices")
+                # Already pruned, just verify size matches
+                if alibi.slopes.shape[0] != target_heads:
+                    print(f"ERROR: ALiBi size mismatch! Has {alibi.slopes.shape[0]}, expected {target_heads}")
+                    return False
+            
+            # Register as persistent buffers
+            alibi.register_buffer('_pruned_heads', torch.tensor(target_heads, dtype=torch.long), persistent=True)
+            alibi.register_buffer('_pruned_total_heads', torch.tensor(target_heads, dtype=torch.long), persistent=True)
+            alibi.heads = target_heads
+            alibi.total_heads = target_heads
+            alibi.bias = None
+            
+            print(f"Successfully updated ALiBi")
+            return True
+        
+        return False
     
     def prune_out_dim_num_head(
     self, pruned_idxes=list(), param_names=list(), skip_output_node=True, **kwargs
 ):
         """Prune entire attention heads."""
-        visited_modules = set()
-        
-        if len(param_names) > 0:
-            # Prune specific parameters by name
-            for param_name in param_names:
-                for module_name in self.leaf_modules:
-                    if not param_name.startswith(module_name):
-                        continue
-                    leaf_op = self.leaf_modules[module_name]
-                    if module_name not in visited_modules:
-                        leaf_op.prune_out_dim(pruned_idxes, param_names=[param_name])
-                    visited_modules.add(module_name)
-        
-        elif len(param_names) == 0 and skip_output_node:
+        if len(param_names) == 0 and skip_output_node:
             preserved_idxes = list(set(range(self.num_groups)) - set(pruned_idxes))
             preserved_idxes.sort()
             
-            # Update module's head count
-            self.module.heads = self.num_groups - len(pruned_idxes)
+            # Find ALL attention modules and update their head counts
+            all_attention_modules = []
+            if self.root_model is not None:
+                for name, parent_module in self.root_model.named_modules():
+                    if type(parent_module).__name__ in ['AttentionLayers', 'Encoder']:
+                        if hasattr(parent_module, 'layers'):
+                            for idx, layer_tuple in enumerate(parent_module.layers):
+                                if len(layer_tuple) > 1:
+                                    attn_module = layer_tuple[1]
+                                    if type(attn_module).__name__ == 'Attention':
+                                        print(f"Found attention layer {idx}: {type(attn_module).__name__}")
+                                        all_attention_modules.append((idx, attn_module))
             
-            # Update attend instance if it exists
-            if hasattr(self.module, 'attend') and self.module.attend is not None:
-                self.module.attend.heads = self.module.heads
+            print(f"Total attention modules found: {len(all_attention_modules)}")
             
-            # Expand pruned head indices to dimension indices
-            expand_pruned_idxes = list()
-            for i in pruned_idxes:
-                for h in range(self.head_dim):
-                    expand_pruned_idxes.append(h + i * self.head_dim)
+            # Update head counts for ALL
+            for idx, attn_module in all_attention_modules:
+                print(f"Updating layer {idx} heads: {attn_module.heads} -> {len(preserved_idxes)}")
+                attn_module.heads = len(preserved_idxes)
+                if hasattr(attn_module, 'attend') and attn_module.attend is not None:
+                    attn_module.attend.heads = len(preserved_idxes)
             
-            # Prune Q, K, V projections (output dimension)
-            for module_name in self.leaf_modules:
-                if self.out_key in module_name:
-                    continue  # Skip output projection
-                leaf_op = self.leaf_modules[module_name]
-                leaf_op.prune_out_dim(expand_pruned_idxes)
-            
-            # Prune output projection INPUT dimension to match pruned Q/K/V
-            for module_name in self.leaf_modules:
-                if self.out_key in module_name:
-                    leaf_op = self.leaf_modules[module_name]
-                    leaf_op.prune_in_dim(expand_pruned_idxes)
-                    break
-    def prune_out_dim_num_head(
-    self, pruned_idxes=list(), param_names=list(), skip_output_node=True, **kwargs
-):
-        """Prune entire attention heads."""
-        visited_modules = set()
-        
-        if len(param_names) > 0:
-            # Prune specific parameters by name
-            for param_name in param_names:
-                for module_name in self.leaf_modules:
-                    if not param_name.startswith(module_name):
-                        continue
-                    leaf_op = self.leaf_modules[module_name]
-                    if module_name not in visited_modules:
-                        leaf_op.prune_out_dim(pruned_idxes, param_names=[param_name])
-                    visited_modules.add(module_name)
-        
-        elif len(param_names) == 0 and skip_output_node:
-            preserved_idxes = list(set(range(self.num_groups)) - set(pruned_idxes))
-            preserved_idxes.sort()
-            self.module.heads = self.num_groups - len(pruned_idxes)
-            
-            # Update operator's own attributes for compute_flops/macs/bops
-            self.num_heads = self.module.heads
+            # Update operator attributes
+            self.num_heads = len(preserved_idxes)
             self.num_groups = self.num_heads
             self.hidden_size = self.num_heads * self.head_dim
             
-            # Update attend instance if it exists
-            if hasattr(self.module, 'attend') and self.module.attend is not None:
-                self.module.attend.heads = self.module.heads
+            # Update shared ALiBi
+            self._update_shared_alibi(preserved_idxes)
             
             # Expand pruned head indices to dimension indices
             expand_pruned_idxes = list()
@@ -1488,46 +1505,65 @@ class E2TTSAttentionOTO(BaseMultiHeadAttentionOTO):
                 for h in range(self.head_dim):
                     expand_pruned_idxes.append(h + i * self.head_dim)
             
-            # Prune Q, K, V projections (output dimension)
-            for module_name in self.leaf_modules:
-                if self.out_key in module_name:
-                    continue
-                leaf_op = self.leaf_modules[module_name]
-                leaf_op.prune_out_dim(expand_pruned_idxes)
+            print(f"Pruning {len(expand_pruned_idxes)} dimensions from {len(all_attention_modules)} layers")
             
-            # Prune output projection INPUT dimension
-            for module_name in self.leaf_modules:
-                if self.out_key in module_name:
-                    leaf_op = self.leaf_modules[module_name]
-                    leaf_op.prune_in_dim(expand_pruned_idxes)
-                    break
-    
+            # Prune ALL attention layers
+            from only_train_once.operation.operator import QuantizeLinearOTO
+            for idx, attn_module in all_attention_modules:
+                print(f"Pruning weights for layer {idx}...")
+                
+                # Prune Q, K, V
+                for proj_name in ['to_q', 'to_k', 'to_v']:
+                    if hasattr(attn_module, proj_name):
+                        proj_module = getattr(attn_module, proj_name)
+                        print(f"  {proj_name} before: {proj_module.weight.shape}")
+                        temp_op = QuantizeLinearOTO(id=f'layer{idx}_{proj_name}', _type='QuantizeLinear', module=proj_module)
+                        temp_op.prune_out_dim(expand_pruned_idxes)
+                        print(f"  {proj_name} after: {proj_module.weight.shape}")
+                
+                # Prune output
+                if hasattr(attn_module, 'to_out'):
+                    if hasattr(attn_module.to_out, '0'):
+                        out_module = attn_module.to_out[0]
+                    elif isinstance(attn_module.to_out, torch.nn.Linear) or type(attn_module.to_out).__name__ == 'QuantizeLinear':
+                        out_module = attn_module.to_out
+                    else:
+                        print(f"  WARNING: Unknown to_out structure: {type(attn_module.to_out)}")
+                        continue
+                        
+                    print(f"  to_out before: {out_module.weight.shape}")
+                    temp_op = QuantizeLinearOTO(id=f'layer{idx}_to_out', _type='QuantizeLinear', module=out_module)
+                    temp_op.prune_in_dim(expand_pruned_idxes)
+                    print(f"  to_out after: {out_module.weight.shape}")
 
-    def compute_flops(self, input_tensor_shape):
-        """Compute FLOPs for attention operation."""
+                    
+    def _compute_macs(self, input_tensor_shape):
+        """Compute MACs for attention"""
         if not input_tensor_shape or len(input_tensor_shape) < 2:
             return 0
         
-        # Handle both [batch, seq, hidden] and [seq, hidden]
         if len(input_tensor_shape) == 2:
             batch_size = 1
             seq_len, hidden_size = input_tensor_shape
-        else:  # len >= 3
+        else:
             batch_size, seq_len, hidden_size = input_tensor_shape[0], input_tensor_shape[1], input_tensor_shape[2]
-        # Q, K, V projections
-        qkv_flops = 3 * batch_size * seq_len * hidden_size * self.num_heads * self.head_dim
-        # Attention computation (QK^T + softmax(QK^T)V)
-        attn_flops = 2 * batch_size * self.num_heads * seq_len * seq_len * self.head_dim=
-        # Output projection
-        out_flops = batch_size * seq_len * self.num_heads * self.head_dim * hidden_size
         
-        return qkv_flops + attn_flops + out_flops
+        # Q, K, V projections
+        qkv_macs = 3 * batch_size * seq_len * hidden_size * self.num_heads * self.head_dim
+        # Attention scores: QK^T + softmax x V
+        attn_macs = 2 * batch_size * self.num_heads * seq_len * seq_len * self.head_dim
+        # Output projection
+        out_macs = batch_size * seq_len * self.num_heads * self.head_dim * hidden_size
+        
+        return qkv_macs + attn_macs + out_macs
 
     def compute_macs(self, output_shape):
-        """MACs are approximately half of FLOPs."""
-        if not output_shape or len(output_shape) < 2:
-            return 0
-        return self.compute_flops(output_shape) // 2
+        """Compute MACs directly."""
+        return self._compute_macs(output_shape)
+
+    def compute_flops(self, input_tensor_shape):
+        """FLOPs = 2 × MACs."""
+        return 2 * self._compute_macs(input_tensor_shape)
 
     def compute_bops(self, macs, weight_bit=None, activation_bit=None):
         """Compute BOPs from MACs."""

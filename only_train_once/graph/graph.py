@@ -257,6 +257,7 @@ class Graph:
             self._post_process_for_transpose()
             self._post_process_for_quantize_linear()
             self._post_process_for_quantize_conv2d()
+            # Add self._post_process_for_e2tts()
             print("Post-processing of graph completed.")
         print(f"Graph has {len(self.nodes)} nodes and {len(self.edges)} edges.")
 
@@ -790,7 +791,7 @@ class Graph:
             module_type = self._get_module_type(module)
             if module_type in COMPOSED_MODULES:
                 composed_op = COMPOSED_MODULES[module_type](
-                    id=module_name, _type=module_type, module=module
+                    id=module_name, _type=module_type, cfg_params={'root_model': self.root_module},module=module
                 )
                 self.composed_ops[composed_op.id] = composed_op
                 return
@@ -1447,7 +1448,7 @@ class Graph:
                         flops_by_type[op_type] = 0
                     flops_by_type[op_type] += cur_flops
         
-        # Print breakdown
+        # # Print breakdown
         print("\n=== FLOPs Breakdown by Operator Type ===")
         for op_type, flops in sorted(flops_by_type.items(), key=lambda x: -x[1]):
             pct = (flops / flops_break_down["total"] * 100) if flops_break_down["total"] > 0 else 0
@@ -1483,26 +1484,7 @@ class Graph:
 
     
     def compute_macs(self, in_million=True, in_billion=False, layerwise=False):
-        """
-        Computes the Multiply-Accumulate Operations (MACs) for the graph.
-
-        Parameters:
-        - in_million (bool): If True, scales the MACs to millions. Default is True.
-        - in_billion (bool): If True, scales the MACs to billions. Default is False.
-        - layerwise (bool): If True, includes detailed layer-wise MACs information. Default is False.
-
-        Returns:
-        - dict: A dictionary containing the total MACs, MACs by node groups, MACs by nodes,
-            and optionally layer-wise MACs information if `layerwise` is True.
-            - "total": Total MACs for the entire graph.
-            - "by_node_groups": MACs broken down by node groups.
-            - "by_nodes": MACs broken down by individual nodes.
-            - "layer_info" (optional): Detailed information for each layer, including:
-            - "name": Node ID.
-            - "type": Operation type of the node.
-            - "macs": MACs for the node.
-
-        """
+        """Computes the Multiply-Accumulate Operations (MACs) for the graph."""
         macs_break_down = dict()
         macs_break_down["total"] = 0
         macs_break_down["by_node_groups"] = dict()
@@ -1510,35 +1492,74 @@ class Graph:
         if layerwise:
             macs_break_down["layer_info"] = []
 
+        macs_by_type = {}
+        skip_count = {"E2TTSAttentionOTO": 0, "LlamaAttentionOTO": 0, "BertAttentionOTO": 0}
         for node_group in self.node_groups.values():
             macs_break_down["by_node_groups"][node_group.id] = 0
 
             is_composed_node_group = type(node_group).__name__ == "NodeGroupComposedOp"
-            for node in node_group:
-                cur_macs = 0
+            
+            
+            if is_composed_node_group:
+                # For composed operators like Attention, compute ONCE at group level
+                first_node = None
+                for node in node_group:
+                    first_node = node
+                    break
                 
-                # Skip nodes without valid output shape
-                if not node.output_shape or len(node.output_shape) == 0:
+                if first_node and first_node.output_shape and len(first_node.output_shape) > 0:
+                    cur_macs = node_group.op.compute_macs(first_node.output_shape)
+                    cur_macs = _scale_value(cur_macs, in_million, in_billion)
+                    macs_break_down["by_node_groups"][node_group.id] = cur_macs
+                    
+                    # Track by type
+                    op_type = type(node_group.op).__name__
+                    if op_type not in macs_by_type:
+                        macs_by_type[op_type] = 0
+                    macs_by_type[op_type] += cur_macs
+                    
+                    for node in node_group:
+                        node_macs = cur_macs / max(sum(1 for _ in node_group), 1)
+                        macs_break_down["by_nodes"][node.id] = node_macs
+                        if layerwise:
+                            macs_break_down["layer_info"].append(
+                                {"name": node.id, "type": node.op_name, "macs": node_macs}
+                            )
+                    macs_break_down["total"] += cur_macs
+            else:
+                for node in node_group:
+                    if hasattr(node, 'op') and hasattr(node.op, 'module_parent'):
+                        continue
                     cur_macs = 0
-                elif not is_composed_node_group:
-                    if type(node.op).__name__ not in ["BertAttentionOTO"]:
+                    if node.output_shape and len(node.output_shape) > 0:
                         cur_macs = node.op.compute_macs(node.output_shape)
-                else:
-                    if node.leaf_op is not None:
-                        cur_macs = node.leaf_op.compute_macs(node.output_shape)
-                    else:
-                        cur_macs = node.op.compute_macs(node.output_shape)
-                
-                cur_macs = _scale_value(cur_macs, in_million, in_billion)
-                macs_break_down["by_node_groups"][node_group.id] += cur_macs
-                macs_break_down["by_nodes"][node.id] = cur_macs
-                macs_break_down["total"] += cur_macs
-                if layerwise:
-                    macs_break_down["layer_info"].append(
-                        {"name": node.id, "type": node.op_name, "macs": cur_macs}
-                    )
+                    
+                    cur_macs = _scale_value(cur_macs, in_million, in_billion)
+                    
+                    op_type = type(node.op).__name__
+                    
+                    if op_type in ["E2TTSAttentionOTO", "LlamaAttentionOTO", "BertAttentionOTO"]:
+                        skip_count[op_type] += cur_macs
+                        continue  # Skip EVERYTHING - don't add to any totals
+                    
+                    # Only add to totals if NOT skipped
+                    macs_break_down["by_node_groups"][node_group.id] += cur_macs
+                    macs_break_down["by_nodes"][node.id] = cur_macs
+                    macs_break_down["total"] += cur_macs
+                    
+                    if op_type not in macs_by_type:
+                        macs_by_type[op_type] = 0
+                    macs_by_type[op_type] += cur_macs
+        
+        
+        print("\n=== MACs Breakdown by Operator Type ===")
+        for op_type, macs in sorted(macs_by_type.items(), key=lambda x: -x[1]):
+            pct = (macs / macs_break_down["total"] * 100) if macs_break_down["total"] > 0 else 0
+            print(f"{op_type:30s}: {macs:10.2f}M ({pct:5.2f}%)")
+        print(f"{'Total':30s}: {macs_break_down['total']:10.2f}M (100.00%)")
+        print("=" * 60 + "\n")
+        
         return macs_break_down
-
     def compute_bops(self, in_million=True, in_billion=False, layerwise=False):
         """
         Compute the number of bit operations (BOPs) for the nodes in the graph.
