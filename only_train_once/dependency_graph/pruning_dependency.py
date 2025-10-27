@@ -356,7 +356,7 @@ def merge_attention_node_groups(graph):
     if len(attention_node_groups) <= 1:
         print(f"Found {len(attention_node_groups)} attention layer(s), no merging needed")
         return
-    
+    num_layers = len(attention_node_groups)
     print(f"Merging {len(attention_node_groups)} E2TTS Attention node groups into one")
     
     # Merge all into the first one
@@ -365,6 +365,8 @@ def merge_attention_node_groups(graph):
         merged_group.merge(node_group)
         # Remove from graph.node_groups
         del graph.node_groups[node_group_id]
+
+    merged_group.op.num_attention_layers = num_layers
     
     # Re-register the merged group with new ID
     del graph.node_groups[first_id]
@@ -372,6 +374,7 @@ def merge_attention_node_groups(graph):
     
     print(f"Merged attention group ID: {merged_group.id}")
     print(f"Total nodes in merged group: {merged_group.num_nodes()}")
+    print(f"Set num_attention_layers={num_layers} for MAC computation")
 
 
 def build_pruning_dependency_graph(graph):    

@@ -498,15 +498,18 @@ class LinearOTO(Operator):
             self.module.weight, preserved_idxes, 1
         )
 
-    def compute_flops(self, input_tensor_shape):
-        # Only consider multiplication
-        # The input_tensor_shape for linear is [*, in_features]
-        flops = 1
-        for dim in input_tensor_shape:
-            flops *= dim
-        flops *= self.module.out_features
-        return flops
-    
+    # def compute_flops(self, input_tensor_shape):
+    #     # Only consider multiplication
+    #     # The input_tensor_shape for linear is [*, in_features]
+    #     flops = 1
+    #     for dim in input_tensor_shape:
+    #         flops *= dim
+    #     flops *= self.module.out_features
+    #     return flops * 2
+    def compute_flops(self, output_shape):
+        """FLOPs = 2 × MACs for linear layers."""
+        return 2 * self.compute_macs(output_shape)
+        
     def compute_macs(self, output_shape=None):
         batch_size = 1 if (output_shape is None or len(output_shape) == 0) else output_shape[0]
         seq_len = 1 if (output_shape is None or len(output_shape) < 2) else output_shape[1]
@@ -1374,6 +1377,7 @@ class E2TTSAttentionOTO(BaseMultiHeadAttentionOTO):
         self.root_model = cfg_params.get('root_model', None) 
         self.out_key = "to_out"
         self.op_name = "e2tts_attention"
+        self.num_attention_layers = cfg_params.get('num_attention_layers', 1)
         self.set_attributes()
 
     def set_attributes(self):
@@ -1559,11 +1563,11 @@ class E2TTSAttentionOTO(BaseMultiHeadAttentionOTO):
 
     def compute_macs(self, output_shape):
         """Compute MACs directly."""
-        return self._compute_macs(output_shape)
+        return self._compute_macs(output_shape) * self.num_attention_layers
 
-    def compute_flops(self, input_tensor_shape):
+    def compute_flops(self, output_shape):
         """FLOPs = 2 × MACs."""
-        return 2 * self._compute_macs(input_tensor_shape)
+        return 2 * self._compute_macs(output_shape) * self.num_attention_layers
 
     def compute_bops(self, macs, weight_bit=None, activation_bit=None):
         """Compute BOPs from MACs."""

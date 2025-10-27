@@ -497,7 +497,49 @@ class Graph:
                 node.op._type = 'chunk-' + str(num_chunks)
                 node.op.cfg_params['num_chunks'] = num_chunks
         
+    # def _post_process_for_e2tts(self):
+    #     # merge quant chains
+    #     self._merge_quant_chains()
     
+    # def _merge_quant_chains(self):
+    #     def _find_quant_chain(start_node):
+    #         chain = [start_node]
+    #         current = start_node
+    #         quant_ops = {'abs', 'sub', 'cast', 'div', 'mul', 'log', 'exp', 
+    #              'round', 'where', 'reshape', 'lessorequal', 'sign'}
+    #         while True:
+    #             outgoing = self.outgoing(current_node)
+    #             if len(outgoing) != 1:
+    #                 break
+    #             next_node = outgoing[0]
+    #             if next_node.op_name not in quant_ops:
+    #                 break
+    #             chain.append(next_node)
+    #             current_node = next_node
+    #             # Prevent infinite loops
+    #             if len(chain)>20:
+    #                 break
+    #         return chain
+        
+    #     quant_starts = []
+    #     for node in self.nodes.items():
+    #         if node.op_name == "abs" and "quant" in str(node.param_names).lower():
+    #             quant_starts.append(node)
+        
+    #     if len(quant_starts) == 0:
+    #         return
+        
+    #     merged_count = 0
+    #     for start in quant_starts:
+    #         chain = _find_quant_chain(start)
+    #         if len(chain) > 5:
+    #             composite_id = f"quantize_composite_{start_node.id}"
+    #             for node in chain[1:]:
+    #                 node.meta = node.meta if hasattr(node,"meta") else {}
+    #                 node.
+
+
+
     def _post_process_for_transpose(self):
         """Handle KV cache in DNN architectures"""
 
@@ -1432,10 +1474,10 @@ class Graph:
             else:
                 # For basic operators, compute per node
                 for node in node_group:
-                    if not node.input_shape or len(node.input_shape) == 0:
+                    if not node.input_shape or len(node.output_shape) == 0:
                         cur_flops = 0
                     else:
-                        cur_flops = node.op.compute_flops(node.input_shape[0])
+                        cur_flops = node.op.compute_flops(node.output_shape)
                     
                     cur_flops = _scale_value(cur_flops, in_million, in_billion)
                     flops_break_down["by_node_groups"][node_group.id] += cur_flops
