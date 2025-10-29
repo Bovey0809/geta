@@ -371,7 +371,9 @@ def merge_attention_node_groups(graph):
     # Re-register the merged group with new ID
     del graph.node_groups[first_id]
     graph.node_groups[merged_group.id] = merged_group
-    
+
+    for node in merged_group.nodes.values():
+        node.node_group_ids = [merged_group.id] # Use node_group_ids for all nodes in merged group
     print(f"Merged attention group ID: {merged_group.id}")
     print(f"Total nodes in merged group: {merged_group.num_nodes()}")
     print(f"Set num_attention_layers={num_layers} for MAC computation")
