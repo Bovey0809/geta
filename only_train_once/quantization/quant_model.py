@@ -3,6 +3,7 @@ import math
 from typing import Dict, Union, Optional
 
 import torch.nn as nn
+import torch
 
 from .quant_layers import LAYER_TO_QUANTLAYER, QuantizationMode, QuantizationType
 from .quant_layers import QuantizeConv2d, QuantizeLinear
@@ -207,7 +208,6 @@ def compare_weight_distributions(
     """
     Verify that unwrapping preserved the weight distributions.
     """
-    import torch
     
     all_match = True
     
