@@ -46,12 +46,14 @@ class GetaDetectionTrainer(DetectionTrainer):
         self.oto = OTO(model, dummy)
         self.oto.mark_unprunable_by_param_names(yolo26_unprunable_names(model))
         it = max(int(iterations), 100)
-        opt = self.oto.geta(
-            variant="adam", lr=lr, lr_quant=1e-3, first_momentum=0.9, weight_decay=decay,
+        # Pruning only -> use HESSO (oto.geta() is the joint prune+quant optimizer and
+        # assumes quantization layers exist, which we don't insert).
+        opt = self.oto.hesso(
+            variant="sgd", lr=lr, weight_decay=decay, first_momentum=momentum,
             target_group_sparsity=self.geta_sparsity,
-            start_projection_step=int(0.10 * it), projection_periods=5, projection_steps=int(0.40 * it),
-            start_pruning_step=int(0.50 * it), pruning_periods=5, pruning_steps=int(0.40 * it),
+            start_pruning_step=int(0.20 * it), pruning_periods=10, pruning_steps=int(0.50 * it),
+            group_divisible=1,
         )
-        print(f"[GETA] sparsity={self.geta_sparsity} iterations={it} "
-              f"proj@{int(0.10*it)} prune@{int(0.50*it)}..{int(0.90*it)}")
+        print(f"[GETA/HESSO] sparsity={self.geta_sparsity} iterations={it} "
+              f"prune@{int(0.20*it)}..{int(0.70*it)}")
         return opt
