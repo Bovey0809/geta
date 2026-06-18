@@ -471,7 +471,7 @@ class Graph:
         for node in self.nodes.values():
             if "onnx::Slice" in node.torch_graph_str:
                 str_info = node.torch_graph_str.split(':')[1].strip()
-                str_info = _get_str_inside_parenthesis(str_info, prefix_str='Float')
+                str_info = _get_str_inside_parenthesis(str_info, prefix_strs=['Float'])
                 if str_info is None:
                     continue
                 str_info = str_info.split(',')
