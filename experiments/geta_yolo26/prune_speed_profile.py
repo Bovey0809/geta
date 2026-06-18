@@ -10,7 +10,7 @@ import numpy as np
 import torch
 from only_train_once import OTO
 from ultralytics import YOLO
-from sanity_check.test_yolo26 import yolo26_unprunable_names
+from sanity_check.test_yolo26 import yolo26_unprunable_names, _max_diff
 
 HERE = os.path.dirname(__file__)
 OUT = os.path.join(HERE, "out")
@@ -80,7 +80,15 @@ def main():
         oto.construct_subnet(out_dir=OUT)
         try:
             cand = torch.load(oto.compressed_model_path, weights_only=False)
-            export_onnx(cand, pruned_onnx, args.imgsz)  # forwards the model internally
+            full = torch.load(oto.full_group_sparse_model_path, weights_only=False)
+            # verify numerical correctness: compressed must match full (zeroed) net
+            xv = torch.rand(1, 3, args.imgsz, args.imgsz)
+            with torch.no_grad():
+                diff = _max_diff(full(xv), cand(xv))
+            if diff > 1e-4:
+                last_err = f"output diff {diff:.3e} > 1e-4 (inconsistent prune)"
+                continue
+            export_onnx(cand, pruned_onnx, args.imgsz)
             compressed = cand
             pruned_params = n_params(cand)
             break
