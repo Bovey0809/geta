@@ -253,7 +253,8 @@ class Graph:
             self.replace_eligible_matmul_as_linear()
             self.remove_isolated_nodes()
             self._assign_torch_graph_str_for_node(str(trace_graph))
-            # self._replace_slice_with_chunk() # Comment out this when running Yolov5
+            self._replace_slice_with_chunk()
+            self._replace_split_with_chunk()
             self._post_process_for_transpose()
             self._post_process_for_quantize_linear()
             self._post_process_for_quantize_conv2d()
@@ -469,7 +470,6 @@ class Graph:
     def _replace_slice_with_chunk(self):
         for node in self.nodes.values():
             if "onnx::Slice" in node.torch_graph_str:
-                print(node.torch_graph_str)
                 str_info = node.torch_graph_str.split(':')[1].strip()
                 str_info = _get_str_inside_parenthesis(str_info, prefix_str='Float')
                 if str_info is None:
@@ -495,8 +495,33 @@ class Graph:
                 node.op_name = 'chunk'
                 node.op._type = 'chunk-' + str(num_chunks)
                 node.op.cfg_params['num_chunks'] = num_chunks
-        
-    
+
+    def _replace_split_with_chunk(self):
+        # Newer architectures (e.g. YOLO26 C2f/C3k2 and attention blocks) emit an
+        # onnx::Split node for the 2-way channel split instead of a series of Slice
+        # ops. Tag equal 2-way splits on the channel axis as chunk-2 so that
+        # post_process_chunk_node halves num_groups for the affected groups.
+        for node in self.nodes.values():
+            if str(node.op_name).lower() != 'split':
+                continue
+            cfg = getattr(node.op, 'cfg_params', None) or {}
+            axis = cfg.get('axis', None)
+            out_shape = getattr(node, 'output_shape', None)
+            # channel axis only (1); skip attention-internal (axis 2) and head-decode splits
+            if axis != 1 or not out_shape or len(out_shape) < 2:
+                continue
+            ins = self.incoming(node)
+            if not ins:
+                continue
+            in_shape = getattr(ins[0], 'output_shape', None)
+            if not in_shape or len(in_shape) < 2:
+                continue
+            in_c, out_c = in_shape[1], out_shape[1]
+            if out_c and in_c == 2 * out_c:
+                node.op_name = 'chunk'
+                node.op._type = 'chunk-2'
+                node.op.cfg_params['num_chunks'] = 2
+
     def _post_process_for_transpose(self):
         """Handle KV cache in DNN architectures"""
 

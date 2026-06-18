@@ -536,3 +536,8 @@ def build_pruning_dependency_graph(graph):
                     visited_modules.add(node.op.module)
                 depend_node_group.overwrite_p_transform = overwrite_p_transform
                 visited.add(depend_node_group.id)
+
+    # Step 11: Halve num_groups for 2-way channel split/chunk groups
+    # (C2f/C3k2 slice splits and attention onnx::Split channel splits) so that a
+    # group's num_groups matches the post-split channel count of its members.
+    post_process_chunk_node(graph)
