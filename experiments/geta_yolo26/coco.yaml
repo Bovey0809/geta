@@ -1,0 +1,6 @@
+# Resolves against ~/datasets/coco (symlink created by scripts/server/link_coco.sh)
+path: /root/datasets/coco
+train: images/train2017
+val: images/val2017
+# Ultralytics standard 80-class COCO names are inherited from its packaged coco.yaml;
+# if class names are needed explicitly, copy `names:` from ultralytics/cfg/datasets/coco.yaml.
