@@ -24,11 +24,26 @@ C2PSA_BLOCK_PREFIXES = ("model.10.", "model.22.")
 
 
 def yolo26_unprunable_names(model):
-    """Full unprunable param-name list for GETA on yolo26n: detection-head output
-    convs + every weight inside the two C2PSA attention blocks."""
-    names = list(YOLO26_HEAD_UNPRUNABLE)
+    """Full unprunable param-name list for GETA on any yolo26 size (n..x).
+
+    Generalizes across model sizes by detecting structure instead of hardcoding
+    indices:
+      * Detection head = last module in model.model; its output convs are the
+        leaf 1x1s ending in '.2.weight' (cv2/cv3/one2one_* -> 4 box / 80 class).
+      * C2PSA attention blocks = any top-level block containing an '.attn.qkv.'
+        param; exclude every weight in those blocks (see module-doc rationale).
+    """
+    head = f"model.{len(model.model) - 1}."
+    c2psa_prefixes = set()
     for n, _ in model.named_parameters():
-        if n.endswith(".weight") and n.startswith(C2PSA_BLOCK_PREFIXES):
+        if ".attn.qkv." in n:
+            c2psa_prefixes.add(".".join(n.split(".")[:2]) + ".")  # e.g. 'model.10.'
+    c2psa_prefixes = tuple(c2psa_prefixes)
+    names = []
+    for n, _ in model.named_parameters():
+        if n.startswith(head) and n.endswith(".2.weight"):
+            names.append(n)
+        elif c2psa_prefixes and n.endswith(".weight") and n.startswith(c2psa_prefixes):
             names.append(n)
     return names
 
