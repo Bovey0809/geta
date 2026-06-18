@@ -19,6 +19,7 @@ def main():
     ap.add_argument("--sparsity", type=float, default=0.5)
     ap.add_argument("--name", default="geta_ft")
     ap.add_argument("--device", default="0")
+    ap.add_argument("--fraction", type=float, default=1.0, help="fraction of train data (use small for a smoke)")
     ap.add_argument("--val", action="store_true", help="run COCO val on the pruned subnet at the end")
     args = ap.parse_args()
 
@@ -31,7 +32,7 @@ def main():
     overrides = dict(model=args.model, data=args.data, epochs=args.epochs, batch=args.batch,
                      imgsz=args.imgsz, device=args.device, name=args.name,
                      amp=False, warmup_epochs=0.0, nbs=args.batch, val=False, plots=False,
-                     optimizer="auto")
+                     fraction=args.fraction, optimizer="auto")
     trainer = GetaDetectionTrainer(overrides=overrides)
     trainer.train()
 
