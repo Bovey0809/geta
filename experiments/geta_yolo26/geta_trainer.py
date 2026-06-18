@@ -28,6 +28,15 @@ class GetaDetectionTrainer(DetectionTrainer):
         if getattr(trainer, "ema", None) is not None:
             trainer.ema.enabled = False
 
+    # GETA's optimizer has a non-standard state_dict() (no 'state' key), which breaks
+    # Ultralytics' fp16 checkpoint save. We construct the pruned subnet directly from
+    # the trained model, so skip Ultralytics' checkpointing / best-weight reload.
+    def save_model(self):
+        pass
+
+    def final_eval(self):
+        pass
+
     def build_optimizer(self, model, name="auto", lr=0.001, momentum=0.9, decay=1e-5, iterations=1e5):
         dev = next(model.parameters()).device
         for n, p in model.named_parameters():
