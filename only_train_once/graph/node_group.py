@@ -241,12 +241,18 @@ class NodeGroup(BasicNodeGroup):
         elif self.is_auxiliary:
             pruning_redundant_idxes = list()
             offset = 0
-            for dependent_node_group in self.dependent_node_groups:
+            widths = getattr(self, 'dependent_widths', None)
+            for i, dependent_node_group in enumerate(self.dependent_node_groups):
+                # Advance the concat offset by the real #channels this input contributes
+                # (dependent_widths), not the resolved group's num_groups, which can be
+                # larger when the input resolves to a merged/excluded group. Fall back to
+                # num_groups when the width is unknown (preserves prior behavior).
+                w = widths[i] if (widths is not None and i < len(widths) and widths[i] is not None) else None
                 if len(dependent_node_group.pruning_redundant_idxes) == 0:
-                    offset += dependent_node_group.num_groups
+                    offset += w if w is not None else dependent_node_group.num_groups
                     continue
                 pruning_redundant_idxes.append(dependent_node_group.pruning_redundant_idxes + offset)
-                offset += (dependent_node_group.pruning_important_idxes.size + dependent_node_group.pruning_redundant_idxes.size)
+                offset += w if w is not None else (dependent_node_group.pruning_important_idxes.size + dependent_node_group.pruning_redundant_idxes.size)
             if len(pruning_redundant_idxes) > 0:
                 self.pruning_redundant_idxes = np.concatenate(pruning_redundant_idxes)
             else:

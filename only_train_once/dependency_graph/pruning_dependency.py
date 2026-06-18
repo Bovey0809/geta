@@ -156,16 +156,22 @@ def set_auxiliary_node_groups(graph):
         if node_group.set_auxiliary():
             visited[node_group.id] = False
     
-    def dfs_helper(graph, node_group, dependent_node_groups):
+    def dfs_helper(graph, node_group, dependent_node_groups, dependent_widths, cur_width=None):
         if not node_group.is_auxiliary:
             if node_group.contain_stem_op():
                 dependent_node_groups.append(node_group)
-            return 
+                # cur_width = #channels this concat input actually contributes, which
+                # can differ from node_group.num_groups when the resolved group is
+                # larger/merged (e.g. shares an excluded attention block). Used to
+                # advance the concat offset by real channels, not group count.
+                dependent_widths.append(cur_width)
+            return
         elif visited[node_group.id]:
             if hasattr(node_group, 'dependent_node_groups'):
                 dependent_node_groups.extend(node_group.dependent_node_groups)
-            return 
-        
+                dependent_widths.extend(getattr(node_group, 'dependent_widths', [None] * len(node_group.dependent_node_groups)))
+            return
+
         concat_nodes = node_group.get_concat_nodes()
         if len(concat_nodes) == 0:
             return
@@ -176,14 +182,17 @@ def set_auxiliary_node_groups(graph):
                 continue
             node_group_in = graph.node_groups[node_in.node_group_ids[0]]
             if node_group_in.id != node_group.id:
-                dfs_helper(graph, node_group_in, dependent_node_groups)
+                osh = getattr(node_in, 'output_shape', None)
+                w = osh[1] if (osh and len(osh) > 1) else None
+                dfs_helper(graph, node_group_in, dependent_node_groups, dependent_widths, w)
 
     for node_group in graph.node_groups.values():
         if node_group.is_auxiliary:
             if visited[node_group.id]:
                 continue
             node_group.dependent_node_groups = list()
-            dfs_helper(graph, node_group, node_group.dependent_node_groups)
+            node_group.dependent_widths = list()
+            dfs_helper(graph, node_group, node_group.dependent_node_groups, node_group.dependent_widths)
 
     # Tackle connection between stem node group and auxiliary node groups
     for node_group in graph.node_groups.values():
