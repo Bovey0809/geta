@@ -41,8 +41,8 @@ def main():
     trainer.oto.construct_subnet(out_dir=out)
 
     # verify the constructed subnet matches the trained (sparsified) model
-    full = torch.load(trainer.oto.full_group_sparse_model_path, weights_only=False)
-    comp = torch.load(trainer.oto.compressed_model_path, weights_only=False)
+    full = torch.load(trainer.oto.full_group_sparse_model_path, weights_only=False).cpu().eval()
+    comp = torch.load(trainer.oto.compressed_model_path, weights_only=False).cpu().eval()
     x = torch.rand(1, 3, args.imgsz, args.imgsz)
     with torch.no_grad():
         diff = _max_diff(full(x), comp(x))
