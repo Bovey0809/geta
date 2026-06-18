@@ -62,22 +62,36 @@ def main():
     default_onnx = os.path.join(OUT, f"{tag}_default.onnx")
     export_onnx(YOLO(args.model).model, default_onnx, args.imgsz)
 
-    # 2) prune (structural) + construct subnet
-    model = YOLO(args.model).model
-    for nm, p in model.named_parameters():
-        if "running_mean" not in nm:
-            p.requires_grad = True
-    oto = OTO(model, torch.rand(1, 3, args.imgsz, args.imgsz))
-    oto.mark_unprunable_by_param_names(yolo26_unprunable_names(model))
-    oto.random_set_zero_groups(target_group_sparsity=args.sparsity)
-    oto.construct_subnet(out_dir=OUT)
-    compressed = torch.load(oto.compressed_model_path, weights_only=False)
-    pruned_params = n_params(compressed)
+    # 2) prune (structural) + construct subnet. random_set_zero_groups can
+    # intermittently produce a channel-inconsistent subnet for the larger
+    # variants (multi-source concat pruning under some random zero patterns), so
+    # retry until the constructed model forwards/exports cleanly.
     pruned_onnx = os.path.join(OUT, f"{tag}_pruned_s{int(args.sparsity*100)}.onnx")
-    export_onnx(compressed, pruned_onnx, args.imgsz)
+    compressed, pruned_params, last_err, attempts = None, None, None, 0
+    for attempt in range(12):
+        attempts = attempt + 1
+        model = YOLO(args.model).model
+        for nm, p in model.named_parameters():
+            if "running_mean" not in nm:
+                p.requires_grad = True
+        oto = OTO(model, torch.rand(1, 3, args.imgsz, args.imgsz))
+        oto.mark_unprunable_by_param_names(yolo26_unprunable_names(model))
+        oto.random_set_zero_groups(target_group_sparsity=args.sparsity)
+        oto.construct_subnet(out_dir=OUT)
+        try:
+            cand = torch.load(oto.compressed_model_path, weights_only=False)
+            export_onnx(cand, pruned_onnx, args.imgsz)  # forwards the model internally
+            compressed = cand
+            pruned_params = n_params(cand)
+            break
+        except Exception as e:
+            last_err = str(e)[:160]
+            continue
+    if compressed is None:
+        raise RuntimeError(f"construct/export failed after {attempts} attempts: {last_err}")
 
     # 3) profile
-    res = {"model": tag, "sparsity": args.sparsity,
+    res = {"model": tag, "sparsity": args.sparsity, "construct_attempts": attempts,
            "params_M": {"default": round(default_params, 3), "pruned": round(pruned_params, 3)},
            "onnx_size_MB": {"default": round(os.path.getsize(default_onnx) / 1e6, 2),
                             "pruned": round(os.path.getsize(pruned_onnx) / 1e6, 2)}}
