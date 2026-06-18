@@ -1,5 +1,5 @@
 path: /root/autodl-tmp/coco
-train: images/val2017
+train: images/train2017
 val: images/val2017
 test: test-dev2017.txt
 names:
