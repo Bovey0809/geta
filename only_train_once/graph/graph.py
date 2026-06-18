@@ -738,7 +738,14 @@ class Graph:
                     trace_graph, torch.onnx.OperatorExportTypes.ONNX
                 )
             elif Version(torch.__version__) >= Version("1.13.0"):
-                trace_graph = torch.onnx._optimize_graph(
+                # torch>=2.8 removed torch.onnx._optimize_graph from the public
+                # namespace; it still lives in torch.onnx.utils with the same signature.
+                if hasattr(torch.onnx, "_optimize_graph"):
+                    _optimize_graph = torch.onnx._optimize_graph
+                else:
+                    import torch.onnx.utils as _onnx_utils
+                    _optimize_graph = _onnx_utils._optimize_graph
+                trace_graph = _optimize_graph(
                     trace_graph, torch.onnx.OperatorExportTypes.ONNX
                 )
             else:
