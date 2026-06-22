@@ -37,3 +37,18 @@ Conclusion across the WHOLE family: one-shot structured pruning WITHOUT retraini
 holds accuracy only to ~1% sparsity for every size. Bigger models retain marginally
 more at 2-5% (x is best: -4.4% at 2%) but all collapse by ~10%. No yolo26 variant
 tolerates meaningful (>~2%) structured pruning without fine-tuning.
+
+## BN recalibration (NO gradients — 800 train imgs forward in train mode, recompute BN stats)
+yolo26x (baseline 0.5626):
+| sparsity | mAP no-recal | mAP + BN-recal | params (M) |
+|---|---|---|---|
+| 2%  | 0.538 | 0.541 (-3.8% vs base) | 54.6 |
+| 5%  | 0.333 | 0.474 (-16%)          | 52.0 |
+| 10% | 0.0005 -> 0.345 (-39%)| | 48.1 |
+| 20% | 0.0 -> 0.033          | | 40.8 |
+
+KEY FINDING: most of the one-shot pruning collapse was STALE BatchNorm running stats,
+not lost capacity. BN recalibration (no backprop, ~seconds) recovers huge amounts:
+5% 0.333->0.474, 10% ~0->0.345. So "pruning without retraining" is far more viable than
+the raw one-shot numbers suggested -- with a free BN-recal pass, yolo26x prunes ~5-10%
+at usable accuracy. Beyond ~10-20% needs real fine-tuning.
