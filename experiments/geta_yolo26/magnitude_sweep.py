@@ -19,7 +19,8 @@ def main():
     ap.add_argument("--data", default=os.path.join(HERE, "coco.yaml"))
     ap.add_argument("--imgsz", type=int, default=640)
     ap.add_argument("--batch", type=int, default=32)
-    ap.add_argument("--sparsities", default="0.05,0.1,0.15,0.2,0.25,0.3,0.4,0.5")
+    ap.add_argument("--sparsities", default="0.05,0.1,0.15,0.2,0.3,0.4,0.5")
+    ap.add_argument("--mode", choices=["global", "local"], default="global")
     args = ap.parse_args()
     spars = [float(s) for s in args.sparsities.split(",")]
     out = os.path.join(HERE, "out", "magnitude_sweep")
@@ -33,7 +34,10 @@ def main():
                 p.requires_grad = True
         oto = OTO(model, torch.rand(1, 3, args.imgsz, args.imgsz))
         oto.mark_unprunable_by_param_names(yolo26_unprunable_names(model))
-        oto._graph.magnitude_set_zero_groups(target_group_sparsity=s)
+        if args.mode == "global":
+            oto._graph.magnitude_set_zero_groups_global(overall_sparsity=s)
+        else:
+            oto._graph.magnitude_set_zero_groups(target_group_sparsity=s)
 
         # accuracy: val the zeroed model directly (== constructed model's mAP)
         y = YOLO(args.model)

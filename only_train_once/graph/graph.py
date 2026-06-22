@@ -1301,73 +1301,90 @@ class Graph:
                 for aux_p in aux_pg["params"]:
                     aux_p.data[offset + zero_group_idxes, ...] = 0.0
 
-    def magnitude_set_zero_groups(self, target_group_sparsity=0.5, num_group_divisible=2):
-        """One-shot magnitude pruning (NO retraining): zero the lowest-L2-norm groups
-        per node group up to target_group_sparsity. Mirrors random_set_zero_groups but
-        selects least-important groups instead of random ones."""
-        from only_train_once.optimizer.importance_score.magnitude import (
-            importance_score_by_magnitude,
-        )
-        print("magnitude_set_zero_groups", target_group_sparsity)
-        for param_group in self.get_param_groups():
-            if not param_group["is_prunable"] or param_group["is_auxiliary"]:
+    def _zero_param_group(self, param_group, zero_group_idxes):
+        """Zero the given group indices in a param group's params + auxiliaries,
+        respecting each param's tensor transform (shared by magnitude pruners)."""
+        if len(zero_group_idxes) == 0:
+            return
+        for p_name, param, p_transform in zip(
+            param_group["p_names"], param_group["params"], param_group["p_transform"],
+        ):
+            if p_transform == TensorTransform.NO_PRUNE:
                 continue
+            if "lora_A" in p_name or "lora_embedding_A" in p_name:
+                continue
+            if p_transform == TensorTransform.TRANSPOSE and len(param.data.shape) > 1:
+                param.data[:, zero_group_idxes, ...] = 0.0
+            elif p_transform == TensorTransform.MULTIHEAD_HEADDIM:
+                idxes = zero_group_idxes.tolist()
+                for h in range(1, param_group["num_heads"]):
+                    idxes.extend([i + param_group["head_dim"] * h for i in zero_group_idxes.tolist()])
+                param.data[idxes] = 0.0
+            elif p_transform in (TensorTransform.MULTIHEAD_NUMHEAD, TensorTransform.MULTIHEAD_NUMHEAD_SPREAD):
+                idxes = []
+                for i in zero_group_idxes.tolist():
+                    for h in range(param_group["head_dim"]):
+                        idxes.append(h + i * param_group["head_dim"])
+                param.data[idxes] = 0.0
+            elif isinstance(p_transform, list):
+                refined = [i for i in zero_group_idxes]
+                for p_transform_type, cfg in reversed(p_transform):
+                    if p_transform_type == TensorTransform.MULTIHEAD_HEADDIM:
+                        refined = index_transformation(refined, p_transform_type, num_heads=cfg["num_heads"], head_dim=cfg["head_dim"])
+                    elif p_transform_type in (TensorTransform.MULTIHEAD_NUMHEAD, TensorTransform.MULTIHEAD_NUMHEAD_SPREAD):
+                        refined = index_transformation(refined, p_transform_type, head_dim=cfg["head_dim"])
+                param.data[refined] = 0.0
+            else:
+                param.data[zero_group_idxes] = 0.0
+        for ng_id, offset in param_group["auxiliary_ngs"]:
+            aux_pg = self.node_groups[ng_id].get_param_groups()
+            for aux_p in aux_pg["params"]:
+                aux_p.data[offset + zero_group_idxes, ...] = 0.0
+
+    def _prunable_param_groups(self):
+        return [pg for pg in self.get_param_groups()
+                if pg["is_prunable"] and not pg["is_auxiliary"] and len(pg["params"]) > 0]
+
+    def magnitude_set_zero_groups(self, target_group_sparsity=0.5, num_group_divisible=2):
+        """Per-layer magnitude pruning (NO retraining): zero the lowest-norm groups in
+        EACH node group up to target_group_sparsity."""
+        from only_train_once.optimizer.importance_score.magnitude import importance_score_by_magnitude
+        print("magnitude_set_zero_groups", target_group_sparsity)
+        for param_group in self._prunable_param_groups():
             num_groups = param_group["num_groups"]
-            num_zero_groups = max(
-                min(
-                    int(target_group_sparsity * num_groups)
-                    // num_group_divisible
-                    * num_group_divisible,
-                    num_groups - 1,
-                ),
-                0,
-            )
-            if len(param_group["params"]) == 0 or num_zero_groups == 0:
+            num_zero = max(min(int(target_group_sparsity * num_groups) // num_group_divisible * num_group_divisible, num_groups - 1), 0)
+            if num_zero == 0:
                 continue
             param_group.setdefault("importance_scores", {})
             importance_score_by_magnitude(param_group)
             scores = param_group["importance_scores"]["magnitude"]
-            zero_group_idxes = np.array(
-                sorted(torch.argsort(scores)[:num_zero_groups].tolist())
-            )
+            zero_group_idxes = np.array(sorted(torch.argsort(scores)[:num_zero].tolist()))
+            self._zero_param_group(param_group, zero_group_idxes)
 
-            for p_name, param, p_transform in zip(
-                param_group["p_names"],
-                param_group["params"],
-                param_group["p_transform"],
-            ):
-                if p_transform == TensorTransform.NO_PRUNE:
-                    continue
-                if "lora_A" in p_name or "lora_embedding_A" in p_name:
-                    continue
-                if p_transform == TensorTransform.TRANSPOSE and len(param.data.shape) > 1:
-                    param.data[:, zero_group_idxes, ...] = 0.0
-                elif p_transform == TensorTransform.MULTIHEAD_HEADDIM:
-                    idxes = zero_group_idxes.tolist()
-                    for h in range(1, param_group["num_heads"]):
-                        idxes.extend([i + param_group["head_dim"] * h for i in zero_group_idxes.tolist()])
-                    param.data[idxes] = 0.0
-                elif p_transform in (TensorTransform.MULTIHEAD_NUMHEAD, TensorTransform.MULTIHEAD_NUMHEAD_SPREAD):
-                    idxes = []
-                    for i in zero_group_idxes.tolist():
-                        for h in range(param_group["head_dim"]):
-                            idxes.append(h + i * param_group["head_dim"])
-                    param.data[idxes] = 0.0
-                elif isinstance(p_transform, list):
-                    refined = [i for i in zero_group_idxes]
-                    for p_transform_type, cfg in reversed(p_transform):
-                        if p_transform_type == TensorTransform.MULTIHEAD_HEADDIM:
-                            refined = index_transformation(refined, p_transform_type, num_heads=cfg["num_heads"], head_dim=cfg["head_dim"])
-                        elif p_transform_type in (TensorTransform.MULTIHEAD_NUMHEAD, TensorTransform.MULTIHEAD_NUMHEAD_SPREAD):
-                            refined = index_transformation(refined, p_transform_type, head_dim=cfg["head_dim"])
-                    param.data[refined] = 0.0
-                else:
-                    param.data[zero_group_idxes] = 0.0
-
-            for ng_id, offset in param_group["auxiliary_ngs"]:
-                aux_pg = self.node_groups[ng_id].get_param_groups()
-                for aux_p in aux_pg["params"]:
-                    aux_p.data[offset + zero_group_idxes, ...] = 0.0
+    def magnitude_set_zero_groups_global(self, overall_sparsity=0.1):
+        """GLOBAL magnitude pruning (NO retraining): rank ALL groups across the network
+        by per-element (avg) magnitude and zero those below the global overall_sparsity
+        threshold, so sensitive layers keep their channels (variable per-layer sparsity)."""
+        from only_train_once.optimizer.importance_score.magnitude import importance_score_by_avg_magnitude
+        print("magnitude_set_zero_groups_global", overall_sparsity)
+        pgs = self._prunable_param_groups()
+        for pg in pgs:
+            pg.setdefault("importance_scores", {})
+            importance_score_by_avg_magnitude(pg)
+        flat = torch.cat([pg["importance_scores"]["avg_magnitude"].flatten() for pg in pgs])
+        k = int(overall_sparsity * flat.numel())
+        if k <= 0:
+            return
+        threshold = torch.kthvalue(flat, k).values
+        for pg in pgs:
+            scores = pg["importance_scores"]["avg_magnitude"]
+            num_groups = pg["num_groups"]
+            zero_mask = scores <= threshold
+            if int(zero_mask.sum()) >= num_groups:  # never zero a whole layer; keep the strongest
+                zero_mask = torch.ones_like(zero_mask, dtype=torch.bool)
+                zero_mask[int(torch.argmax(scores))] = False
+            zero_group_idxes = np.array(sorted(torch.nonzero(zero_mask).flatten().tolist()))
+            self._zero_param_group(pg, zero_group_idxes)
 
     def set_pruning_redundant_idxes(self):
         for node_group in self.node_groups.values():
