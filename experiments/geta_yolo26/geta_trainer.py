@@ -17,6 +17,7 @@ from sanity_check.test_yolo26 import yolo26_unprunable_names
 
 class GetaDetectionTrainer(DetectionTrainer):
     geta_sparsity = 0.5  # set on the class before train()
+    geta_lr = None       # if set, overrides Ultralytics' auto LR (use a fine-tune LR)
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -45,6 +46,8 @@ class GetaDetectionTrainer(DetectionTrainer):
         dummy = torch.rand(1, 3, self.args.imgsz, self.args.imgsz, device=dev)
         self.oto = OTO(model, dummy)
         self.oto.mark_unprunable_by_param_names(yolo26_unprunable_names(model))
+        if self.geta_lr is not None:
+            lr = self.geta_lr  # fine-tune LR (Ultralytics 'auto' otherwise forces lr0=0.01)
         it = max(int(iterations), 100)
         # Pruning only -> use HESSO (oto.geta() is the joint prune+quant optimizer and
         # assumes quantization layers exist, which we don't insert).
