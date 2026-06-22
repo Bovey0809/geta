@@ -1301,6 +1301,74 @@ class Graph:
                 for aux_p in aux_pg["params"]:
                     aux_p.data[offset + zero_group_idxes, ...] = 0.0
 
+    def magnitude_set_zero_groups(self, target_group_sparsity=0.5, num_group_divisible=2):
+        """One-shot magnitude pruning (NO retraining): zero the lowest-L2-norm groups
+        per node group up to target_group_sparsity. Mirrors random_set_zero_groups but
+        selects least-important groups instead of random ones."""
+        from only_train_once.optimizer.importance_score.magnitude import (
+            importance_score_by_magnitude,
+        )
+        print("magnitude_set_zero_groups", target_group_sparsity)
+        for param_group in self.get_param_groups():
+            if not param_group["is_prunable"] or param_group["is_auxiliary"]:
+                continue
+            num_groups = param_group["num_groups"]
+            num_zero_groups = max(
+                min(
+                    int(target_group_sparsity * num_groups)
+                    // num_group_divisible
+                    * num_group_divisible,
+                    num_groups - 1,
+                ),
+                0,
+            )
+            if len(param_group["params"]) == 0 or num_zero_groups == 0:
+                continue
+            param_group.setdefault("importance_scores", {})
+            importance_score_by_magnitude(param_group)
+            scores = param_group["importance_scores"]["magnitude"]
+            zero_group_idxes = np.array(
+                sorted(torch.argsort(scores)[:num_zero_groups].tolist())
+            )
+
+            for p_name, param, p_transform in zip(
+                param_group["p_names"],
+                param_group["params"],
+                param_group["p_transform"],
+            ):
+                if p_transform == TensorTransform.NO_PRUNE:
+                    continue
+                if "lora_A" in p_name or "lora_embedding_A" in p_name:
+                    continue
+                if p_transform == TensorTransform.TRANSPOSE and len(param.data.shape) > 1:
+                    param.data[:, zero_group_idxes, ...] = 0.0
+                elif p_transform == TensorTransform.MULTIHEAD_HEADDIM:
+                    idxes = zero_group_idxes.tolist()
+                    for h in range(1, param_group["num_heads"]):
+                        idxes.extend([i + param_group["head_dim"] * h for i in zero_group_idxes.tolist()])
+                    param.data[idxes] = 0.0
+                elif p_transform in (TensorTransform.MULTIHEAD_NUMHEAD, TensorTransform.MULTIHEAD_NUMHEAD_SPREAD):
+                    idxes = []
+                    for i in zero_group_idxes.tolist():
+                        for h in range(param_group["head_dim"]):
+                            idxes.append(h + i * param_group["head_dim"])
+                    param.data[idxes] = 0.0
+                elif isinstance(p_transform, list):
+                    refined = [i for i in zero_group_idxes]
+                    for p_transform_type, cfg in reversed(p_transform):
+                        if p_transform_type == TensorTransform.MULTIHEAD_HEADDIM:
+                            refined = index_transformation(refined, p_transform_type, num_heads=cfg["num_heads"], head_dim=cfg["head_dim"])
+                        elif p_transform_type in (TensorTransform.MULTIHEAD_NUMHEAD, TensorTransform.MULTIHEAD_NUMHEAD_SPREAD):
+                            refined = index_transformation(refined, p_transform_type, head_dim=cfg["head_dim"])
+                    param.data[refined] = 0.0
+                else:
+                    param.data[zero_group_idxes] = 0.0
+
+            for ng_id, offset in param_group["auxiliary_ngs"]:
+                aux_pg = self.node_groups[ng_id].get_param_groups()
+                for aux_p in aux_pg["params"]:
+                    aux_p.data[offset + zero_group_idxes, ...] = 0.0
+
     def set_pruning_redundant_idxes(self):
         for node_group in self.node_groups.values():
             if node_group.is_prunable and not node_group.is_auxiliary:
