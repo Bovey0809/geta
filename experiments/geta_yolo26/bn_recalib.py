@@ -41,13 +41,8 @@ def main():
     calib_ds = build_yolo_dataset(cfg, data["train"], args.batch, data, mode="val", stride=32)
     calib_loader = build_dataloader(calib_ds, args.batch, workers=4, shuffle=True)
 
-    def val(model):
-        y = YOLO(args.model)
-        y.model = model.eval().cuda()
-        m = y.val(data=args.data, imgsz=args.imgsz, batch=args.batch, device=0, verbose=False)
-        return float(m.box.map), float(m.box.map50)
-
-    for s in spars:
+    def prune_fresh(s):
+        # magnitude pruning is deterministic, so a fresh prune reproduces the same subnet
         model = YOLO(args.model).model
         for n, p in model.named_parameters():
             if "running_mean" not in n:
@@ -55,11 +50,21 @@ def main():
         oto = OTO(model, torch.rand(1, 3, args.imgsz, args.imgsz))
         oto.mark_unprunable_by_param_names(yolo26_unprunable_names(model))
         oto._graph.magnitude_set_zero_groups(target_group_sparsity=s)
-        model = model.cuda()
+        return model.cuda()
 
-        pre_map, pre_map50 = val(model)
+    def val(model):
+        # NOTE: y.val() fuses Conv+BN, so only call on a model you won't recalibrate after.
+        y = YOLO(args.model)
+        y.model = model.eval().cuda()
+        m = y.val(data=args.data, imgsz=args.imgsz, batch=args.batch, device=0, verbose=False)
+        return float(m.box.map), float(m.box.map50)
 
-        # BN recalibration: cumulative-average running stats over calib_batches forwards
+    for s in spars:
+        # before: fresh pruned model, val directly (fuses it — fine, discarded after)
+        pre_map, pre_map50 = val(prune_fresh(s))
+
+        # after: a second fresh prune, recalibrate BN BEFORE any val/fusion, then val
+        model = prune_fresh(s)
         reset_bn(model)
         model.train()
         seen = 0
@@ -77,7 +82,7 @@ def main():
                "map50_before": round(pre_map50, 4), "map50_after": round(post_map50, 4),
                "calib_imgs": seen * args.batch}
         print("BNRECAL", json.dumps(rec))
-        del model, oto
+        del model
         torch.cuda.empty_cache()
     print("DONE")
 
