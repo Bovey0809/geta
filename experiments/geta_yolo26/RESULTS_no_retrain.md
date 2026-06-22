@@ -52,3 +52,19 @@ not lost capacity. BN recalibration (no backprop, ~seconds) recovers huge amount
 5% 0.333->0.474, 10% ~0->0.345. So "pruning without retraining" is far more viable than
 the raw one-shot numbers suggested -- with a free BN-recal pass, yolo26x prunes ~5-10%
 at usable accuracy. Beyond ~10-20% needs real fine-tuning.
+
+## BN-recal across the FULL family (mAP50-95 after recal; no gradients)
+| sparsity | n (base .395) | s (.472) | m (.518) | x (.563) |
+|---|---|---|---|---|
+| 2%  | 0.372 (94%) | 0.424 (90%) | 0.480 (93%) | 0.541 (96%) |
+| 5%  | 0.293 (74%) | 0.348 (74%) | 0.402 (78%) | 0.474 (84%) |
+| 10% | 0.121       | 0.148       | 0.225       | 0.345 (61%) |
+(% = fraction of baseline retained)
+
+Recovery before->after BN-recal at 5%: n .262->.293, s .141->.348, m .242->.402, x .333->.474.
+At 10% all were ~0 before; after: n .121, s .148, m .225, x .345.
+
+TAKEAWAY: BN recalibration (free, no backprop) makes one-shot pruning genuinely useful.
+With it, every yolo26 size keeps ~90-96% mAP at 2% sparsity, and the bigger the model the
+more it prunes for free (x: 84% retained at 5%, still 0.345 at 10%). The earlier "collapse"
+was mostly stale BN stats. Beyond ~10% (or for nano) real fine-tuning is still needed.
