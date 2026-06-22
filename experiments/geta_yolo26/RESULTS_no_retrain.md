@@ -68,3 +68,13 @@ TAKEAWAY: BN recalibration (free, no backprop) makes one-shot pruning genuinely 
 With it, every yolo26 size keeps ~90-96% mAP at 2% sparsity, and the bigger the model the
 more it prunes for free (x: 84% retained at 5%, still 0.345 at 10%). The earlier "collapse"
 was mostly stale BN stats. Beyond ~10% (or for nano) real fine-tuning is still needed.
+
+## Short fine-tune at 5% sparsity (yolo26n) — recovery ladder
+| method (5% sparsity) | mAP50-95 | % of baseline (0.395) |
+|---|---|---|
+| one-shot, no recovery        | 0.262 | 66% |
+| one-shot + BN-recal (free)   | 0.293 | 74% |
+| 5-epoch FT @ lr0=0.01 (wrong)| 0.259 | 66% |
+| 5-epoch FT @ lr0=1e-3        | 0.359 | 91% |
+LR was the bottleneck: Ultralytics 'auto' forces lr0=0.01 (from-scratch LR); for a
+fine-tune use ~1e-3. 5 epochs @ 1e-3 recovers to within ~9% of baseline (params -8%).
