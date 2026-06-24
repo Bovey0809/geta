@@ -15,3 +15,21 @@ NOTE: accuracy (COCO mAP) requires GETA fine-tuning on COCO — not yet measured
 
 GPU speedup scales with model size (nano overhead-bound; m/l/x compute-bound, 20-30% faster).
 CPU speedups large across the board.
+
+## group_divisible=16 (Tensor-Core alignment, per GETA issue #15) + TensorRT — sparsity 0.5
+GPU latency bs1, pruned vs default (ms):
+| model | TRT div2 | TRT div16 | CUDA div2 | CUDA div16 | speedup |
+|---|---|---|---|---|---|
+| n | 8.49/7.98 | 8.46/8.26 | 8.69/8.60 | 8.68/8.48 | ~flat (launch-bound) |
+| m | 12.10/14.60 | 12.24/14.89 | 12.13/14.76 | 12.18/14.73 | -17% |
+| x | 17.47/24.48 | 17.66/24.50 | 17.52/24.56 | 17.59/24.41 | -29% |
+
+FINDINGS:
+- **divisible=16 makes NO measurable difference for YOLO26** (same params, same latency as div=2).
+  YOLO26's channel widths are already 16/32-friendly, so pruning already lands Tensor-Core-aligned.
+  Issue #15's alignment fix mattered for arbitrary-width models (RF-DETR/ResNet), not YOLO26.
+- **TensorRT ~= CUDA EP here**: no big fusion win, because there's no quantization to fuse.
+- GPU speedup is real and scales with size (nano flat, m -17%, x -29%) on BOTH runtimes -- already
+  present at div=2; pruning alone delivers it.
+- The untapped lever for a large (~5x) speedup (per #15) is INT8 quantization + explicit QDQ export
+  -> TensorRT INT8 fusion. Pruning alone gives the -17 to -29% measured above.
