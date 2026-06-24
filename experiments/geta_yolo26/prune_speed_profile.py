@@ -78,7 +78,7 @@ def main():
                 p.requires_grad = True
         oto = OTO(model, torch.rand(1, 3, args.imgsz, args.imgsz))
         oto.mark_unprunable_by_param_names(yolo26_unprunable_names(model))
-        oto.random_set_zero_groups(target_group_sparsity=args.sparsity, num_group_divisible=args.divisible)
+        oto._graph.random_set_zero_groups(target_group_sparsity=args.sparsity, num_group_divisible=args.divisible)
         oto.construct_subnet(out_dir=OUT)
         try:
             cand = torch.load(oto.compressed_model_path, weights_only=False)
