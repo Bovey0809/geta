@@ -33,3 +33,24 @@ FINDINGS:
   present at div=2; pruning alone delivers it.
 - The untapped lever for a large (~5x) speedup (per #15) is INT8 quantization + explicit QDQ export
   -> TensorRT INT8 fusion. Pruning alone gives the -17 to -29% measured above.
+
+## INT8 QDQ export + REAL TensorRT (yolo26x, bs1, 640) — corrects earlier "TRT"=CUDA fallback
+IMPORTANT: earlier "TensorRT_fp16" numbers were actually CUDA EP (TensorRT lib wasn't installed
+-> silent fallback). After installing TensorRT 10.16 (libnvinfer.so.10), verified EP=TensorrtExecutionProvider:
+
+| config | latency | note |
+|---|---|---|
+| default, CUDA EP        | 24.5 ms | (onnxruntime CUDA) |
+| default, TensorRT FP16  | 14.4 ms | TRT fusion: -41% vs CUDA |
+| pruned,  TensorRT FP16  | 12.8 ms | + pruning: -11% more (~-48% vs default-CUDA) |
+| default, TensorRT INT8-QDQ | 40.0 ms | SLOWER |
+| pruned,  TensorRT INT8-QDQ | 30.4 ms | SLOWER |
+INT8 model files are ~4x smaller (236->60.7MB, 98->26.1MB).
+
+FINDINGS:
+- The big speedup for YOLO26 is **TensorRT FP16** (-41% vs onnxruntime CUDA), NOT INT8.
+- **INT8 QDQ is ~2.5-3x SLOWER for YOLO26** even on real TensorRT: its attention + concat-heavy +
+  NMS-free head can't stay in INT8, so TRT pays constant INT8<->FP reformatting overhead. The
+  issue-#15 5x INT8 win was on ResNet/RF-DETR (cleanly fusible); it does NOT transfer to YOLO26.
+- Best real-world config measured: **pruned + TensorRT FP16 = 12.8 ms** (vs 24.5 ms default-CUDA).
+- INT8 still wins on model SIZE (~4x smaller) if storage/bandwidth-bound.
