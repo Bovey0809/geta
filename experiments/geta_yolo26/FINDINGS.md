@@ -87,3 +87,19 @@ or a long fine-tune of l/m we can only partially afford on a single 12 GB card.
   prune_speed_profile) + GETA fixes in `only_train_once/graph/graph.py`,
   `only_train_once/dependency_graph/pruning_dependency.py`, `only_train_once/graph/node_group.py`.
 - Result files: `RESULTS_speed.md`, `RESULTS_no_retrain.md`, this file.
+
+## 8. Final verdict: pruning vs TensorRT-FP16 for "faster + same mAP" (yolo26m demo, 2026-06-25)
+| yolo26m | params | size | mAP50-95 | TRT-FP16 bs1 |
+|---|---|---|---|---|
+| default | 21.9M | 87.6MB | 0.518 | 9.28ms |
+| pruned 10% + 15ep ft (lr1e-3) | 17.0M (-22%) | 68.3MB (-22%) | 0.456 (-12%) | 9.11ms (-2%) |
+- default-m CUDA ~14.8ms -> TensorRT FP16 9.28ms = -37%, LOSSLESS (no pruning).
+- Pruning m: -22% size but only -2% bs1 latency, at -12% mAP (unrecoverable on this setup) = bad trade.
+
+CONCLUSION (whole study):
+- "Faster + same mAP" on YOLO26 = **TensorRT FP16 on the dense model** (-37 to -41%, zero mAP loss). No pruning needed.
+- Pruning gives smaller files + CPU speedups + (only on huge x) ~ -11..-30% GPU latency, but costs mAP YOLO26
+  won't fully give back via fine-tuning (recovery plateaus ~85-91%). At bs1 on GPU it barely helps latency on n/s/m.
+- INT8 QDQ: slower AND lossy for YOLO26 (attention/concat/NMS-free head won't INT8-fuse). Avoid.
+- YOLO26 is too efficiently designed to prune losslessly; the framework value here is the (now-fixed) ability to
+  prune it at all, useful when size/CPU matter and a few mAP points are acceptable.
