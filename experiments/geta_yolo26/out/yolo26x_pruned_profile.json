@@ -1,0 +1,57 @@
+{
+  "tag": "x",
+  "sparsity": 0.5,
+  "params_M": {
+    "default": 58.993,
+    "pruned": 20.37
+  },
+  "pruned_source": "trained_construct",
+  "onnx_size_MB": {
+    "default": 235.96,
+    "pruned": 81.65
+  },
+  "latency": {
+    "CPU": {
+      "default": {
+        "ep": "CPUExecutionProvider",
+        "mean_ms": 588.054,
+        "p50_ms": 588.665,
+        "p95_ms": 715.583
+      },
+      "pruned": {
+        "ep": "CPUExecutionProvider",
+        "mean_ms": 437.118,
+        "p50_ms": 408.844,
+        "p95_ms": 496.684
+      }
+    },
+    "TensorRT_fp16": {
+      "default": {
+        "ep": "CUDAExecutionProvider",
+        "mean_ms": 9.758,
+        "p50_ms": 9.738,
+        "p95_ms": 9.836
+      },
+      "pruned": {
+        "ep": "CUDAExecutionProvider",
+        "mean_ms": 9.906,
+        "p50_ms": 9.856,
+        "p95_ms": 9.981
+      }
+    },
+    "CUDA": {
+      "default": {
+        "ep": "CUDAExecutionProvider",
+        "mean_ms": 9.818,
+        "p50_ms": 9.818,
+        "p95_ms": 9.89
+      },
+      "pruned": {
+        "ep": "CUDAExecutionProvider",
+        "mean_ms": 9.939,
+        "p50_ms": 9.936,
+        "p95_ms": 10.022
+      }
+    }
+  }
+}

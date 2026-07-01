@@ -28,3 +28,17 @@ to recover) and can't fully recover on efficient nets.
 
 ## Repro: experiments/ofa/ofa_demo.py (needs ofa, gdown; supernet ckpt cached at .torch/ofa_nets/;
 ## github-raw download truncates on AutoDL -> download locally + scp the 31MB ckpt).
+
+## YOLO26 depth-elastic OFA (2026-07-01, RTX Pro 6000) — dead end, same root cause as pruning
+Made yolo26l depth-elastic (each C3k runs 2->1 inner residual bottlenecks; elastic_yolo26.py),
+sandwich-trained so d=2 (full) + d=1 (shrunk) are both usable with no retraining.
+| checkpoint | d=2 (46.9 GFLOPs) | d=1 (40.96 GFLOPs, -13%) |
+|---|---|---|
+| pretrained-l | 0.5377 | 0.0 |
+| 10-ep naive sandwich | 0.5377 | 0.0 |
+| 5-ep sandwich + feature-KD (lambda=10) | 0.5377 | 0.0 |
+d=1 stuck at EXACTLY 0.0. calib_kd.py measured the cause: d=1 neck features (Detect inputs)
+differ from d=2 by ~100% relative MSE (P3 0.58, P4 0.99, P5 1.12) -> the "elastic" 2nd bottleneck
+is ESSENTIAL computation, not residual refinement. KD can't make a lower-capacity net reproduce a
+higher-capacity one (at lambda=10 KD dominated the loss; d=1 still didn't move). d=1 forward is
+correct (finite, right shape) -- the ceiling is fundamental, not a bug. See ../CONCLUSION.md.

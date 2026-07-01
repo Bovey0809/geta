@@ -103,3 +103,13 @@ CONCLUSION (whole study):
 - INT8 QDQ: slower AND lossy for YOLO26 (attention/concat/NMS-free head won't INT8-fuse). Avoid.
 - YOLO26 is too efficiently designed to prune losslessly; the framework value here is the (now-fixed) ability to
   prune it at all, useful when size/CPU matter and a few mAP points are acceptable.
+
+## 9. Definitive result: pruned-x full-COCO fine-tune (2026-07-01, RTX Pro 6000 96GB)
+The §6 "pruned beats default" attempt, finally run properly on a big GPU: prune yolo26x ->
+**20.37M params**, 50-epoch full-COCO fine-tune (lr1e-3, batch32), then construct + val.
+**Result: mAP50-95 = 0.450** (mAP50 0.618), construct_diff 1.2e-4.
+- Pareto-DOMINATED: default-m (20.4M) = 0.518 beats it at equal params; default-s (9.5M, 0.472)
+  beats it with <half the params. Recovered only 80% of dense-x (0.5626).
+- Speed/size of the 20.37M subnet (bs1, 640): ONNX -65% (236->82MB), CPU -26% (588->437ms),
+  **GPU ~0%** (9.82->9.94ms, launch-bound on Blackwell).
+CONCLUSION: structured pruning is a dead end for YOLO26 (no redundant capacity). See ../CONCLUSION.md.

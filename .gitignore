@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+*.pt
+*.onnx
+*.engine
+*.profile
+runs/
+log_vanilla.txt
