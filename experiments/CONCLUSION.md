@@ -59,11 +59,34 @@ one's function (at λ=10 the KD term dominated the loss and d=1 still didn't mov
 best case is a mediocre sub-net at only −13 % FLOPs. The d=1 forward itself is correct
 (finite outputs, right shape) — the ceiling is fundamental, not a bug.
 
+## Paradigm 3 — knowledge distillation x→m (method improved; fine-tune recipe capped)
+Instead of removing capacity, add a teacher: Ultralytics' built-in KD
+(`distill_model=`, score-weighted-L2 neck-feature loss) distilling x (0.5626) into a
+full-size m (20.4 M, default 0.518). We implemented and ablated three improvements
+(details: `distill/DISTILL_RESULTS.md`):
+
+| config (8 ep @ 50 % screening) | mAP50-95 |
+|---|---|
+| **+CWD (channel-wise KL)** | **0.5036** |
+| +FGD global | 0.5022 |
+| +logit KD | 0.5015 |
+| stock (built-in) | 0.5014 |
+| all three | 0.5011 |
+
+**CWD > stock** (controlled, same recipe) — a real improvement to the loss; stacking all
+terms hurts. But the full 40-epoch CWD run reached only **0.5031 — below default-m's
+0.518**: KD-as-fine-tune first disrupts a converged student, then can't even recover the
+baseline (8-ep screening ≈ 40-ep run). The honest remaining test is KD during **full
+from-scratch training** (~500 ep, ~100 h+) — untested here.
+
 ## Unified conclusion
 Structured pruning (remove channels) and depth-elastic OFA (remove blocks) both delete
 capacity that YOLO26 actually uses, and neither fine-tuning nor knowledge distillation
-recovers it. **YOLO26 is Pareto-efficient across its n/s/m/l/x family — the right-sized
-default always beats a compressed larger model at equal size.**
+recovers it. Post-hoc KD-fine-tuning of a right-sized student doesn't lift it above its
+own baseline either. **YOLO26 is Pareto-efficient across its n/s/m/l/x family — the
+right-sized default beats every cheap post-hoc size/accuracy intervention we tried.**
+The one method improvement that survived controlled testing: **CWD channel-wise KL beats
+the stock score-weighted L2 in Ultralytics' distillation loss** (upstream candidate).
 
 ### What *does* give "faster at the same mAP"
 **TensorRT FP16 on the dense model** — lossless, −37 to −41 % GPU latency, no mAP change
