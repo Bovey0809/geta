@@ -12,16 +12,35 @@ point from a single training run.
 which are Pareto points that *do not exist* in the n/s/m/l/x family. w=0.5 beating
 yolo26n's free 0.395 is the stretch goal, not the bar.
 
-| w | ~params | target mAP50-95 | note |
-|---|---|---|---|
-| 1.000 | 9.5 M | 0.472 | must stay = default s |
-| 0.875 | ~7.5 M | ≥ 0.45 | **new Pareto point** |
-| 0.750 | ~5.8 M | ≥ 0.43 | **new Pareto point** |
-| 0.625 | ~4.3 M | ≥ 0.41 | **new Pareto point** |
-| 0.500 | ~3.1 M | ≥ 0.395 | stretch: beat default n |
+### MEASURED width/params curve (P1 complete, 2026-08-20)
 
-(param numbers are estimates pending the P0 measurement; attention blocks stay
-full-width until P5, so the real curve is flatter than pure w² scaling.)
+Real numbers from `count_active_params`, not estimates. 82 of 114 Convs are
+planned; **32 stay frozen** (C2PSA L10, C3k2-attn L22, Detect interior) — and
+those are the *widest* layers in the net, so the curve is much flatter than w²:
+
+| w | active params | vs w=1.0 | n→s interpolation bar | Gate D target |
+|---|---|---|---|---|
+| 1.000 | **10.01 M** | — | — | hold 0.472 |
+| 0.875 | **8.49 M** | −15 % | 0.461 | > 0.461 |
+| 0.750 | **7.15 M** | −29 % | 0.446 | > 0.446 |
+| 0.625 | **6.01 M** | −40 % | 0.433 | > 0.433 |
+| 0.500 | **5.05 M** | −50 % | 0.422 | > 0.422 |
+
+The "n→s interpolation bar" is the straight line between default **n**
+(2.6 M, 0.395) and default **s** (9.5 M, 0.472) — i.e. `0.395 + (P−2.6)·0.01116`.
+Beating that line is what makes a width a genuinely *new* Pareto point rather
+than something you could already get by picking an existing model.
+
+**Consequence for the goal — the stretch target moved.** w=0.5 is **5.05 M**,
+not the ~3.1 M originally estimated, so it is nearly 2× yolo26n's 2.6 M. "Beat
+n at w=0.5" is therefore **unreachable by construction** while attention stays
+frozen: the frozen blocks alone floor the model well above n. So:
+
+* **P5 (attention elasticity) is no longer optional** if we want to reach
+  n-territory at all. It is the only remaining source of savings at low width.
+* The **intermediate widths remain the real product** and are unaffected: 5–7 M
+  sits squarely in the empty gap between n (2.6 M) and s (9.5 M), where the
+  family offers nothing. Gate D is judged against the interpolation line above.
 
 ---
 
@@ -211,10 +230,33 @@ Gates are falsifiable stop conditions. **If a gate fails, we stop and report —
   Bugs A+B, not capacity. ✅ *done in this pass*
 - `set_layer_width()` localization harness; measure real per-width param counts.
 
-### P1 — `ChannelPlan` + module-by-module correctness *(6–8 h, **local CPU, ¥0**)*
-Land M1 → M6 in order, each with its oracle test green and `w=1.0` bit-identity held.
-No GPU, no COCO, no rental. **This is the bulk of the work and it is free.**
-- Exit criterion: all oracle tests pass for w ∈ {0.875, 0.75, 0.625, 0.5}.
+### P1 — `ChannelPlan` + module-by-module correctness — ✅ **DONE (164/164 pass)**
+Landed M1 → M6, each with its oracle test green and `w=1.0` bit-identity held.
+
+| module | scope | result |
+|---|---|---|
+| M1 plain Conv | L0/1/3/5/7/17/20 shapes | exact at all widths |
+| M2 C3k2 + Bottleneck | L2, L4 (+ e=0.5, n=2) | exact |
+| M3 C3k2 + nested C3k | L6, L8, L13, L16, L19 | exact |
+| M4 SPPF | L9, repeated cat + `y+x` residual | exact |
+| M5/M6 whole graph | Concat, Upsample, Detect, frozen blocks | bit-identical at w=1.0; finite forward at every width |
+| regression | old contiguous slicing | **fails** oracle (err 1.069) while ChannelPlan is **exact** (0.000) |
+
+The regression row is the load-bearing one: it proves the oracle would have
+caught the original bug, and that the old slicing was correct *only* for
+single-group plain Convs — which is why it hid behind one end-to-end number.
+
+**Structural problem found and solved during M5/M6.** A frozen block cannot
+receive a sliced tensor (its convs expect full `in_channels`), which naively
+forces full width all the way back through the backbone. Two pieces fixed it:
+* `ChannelPlan` gained per-group **`elastic` flags**, so one tensor can mix
+  frozen and shrinking segments — required for `L21 = Concat[L20 elastic,
+  L10 frozen]`.
+* **`plan_adapter_chain`**: depth-wise convs pass the sliced layout through,
+  and the first `groups==1` conv becomes an *adapter* (sliced input columns,
+  full output), restoring full width for the frozen interior. Detect's `cv3`
+  branches start with a depth-wise conv, which is precisely why the
+  pass-through case is needed rather than just adapting the first conv.
 
 ### P2 — Recal sanity + first real measurement → **GATE A** *(1–2 h GPU, ~¥5)*
 - **Recal sanity gate first:** recal at `w=1.0` must return **≈0.472**. Use
