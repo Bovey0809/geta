@@ -59,30 +59,50 @@ def interp_bar(params_m: float) -> float:
     return _N[1] + (params_m - _N[0]) * _SLOPE
 
 
-def build_calib_batches(data_yaml: str, imgsz: int, batch: int, n_batches: int,
-                        device):
-    """Yield normalised image batches from the TRAIN split."""
-    from ultralytics.data.build import build_yolo_dataset
-    from ultralytics.data.utils import check_det_dataset
-    from ultralytics.cfg import get_cfg
+class CalibBatches:
+    """Re-iterable stream of normalised TRAIN-split image batches.
 
-    data = check_det_dataset(data_yaml)
-    cfg = get_cfg()
-    cfg.imgsz = imgsz
-    cfg.rect = False
-    # mode="val" -> deterministic letterbox, no augmentation. We only want the
-    # train *distribution*, not train-time augmentation.
-    ds = build_yolo_dataset(cfg, data["train"], batch, data, mode="val", stride=32)
-    loader = torch.utils.data.DataLoader(
-        ds, batch_size=batch, shuffle=True, num_workers=8,
-        collate_fn=getattr(ds, "collate_fn", None), drop_last=True,
-    )
-    out = []
-    for i, b in enumerate(loader):
-        if i >= n_batches:
-            break
-        out.append(b["img"].to(device).float() / 255.0)
-    return out
+    Two properties this must have, both learned the hard way:
+
+    * **Streamed, not materialised.** Holding 200 batches of 32x3x640x640 on
+      the GPU is ~31 GB and OOMs a 32 GB card instantly. Each batch is loaded
+      on demand and only moved to the device inside the recal loop.
+    * **Identical images for every width.** Widths are only comparable if they
+      were calibrated on the same data, so we draw one seeded index subset up
+      front and iterate it with `shuffle=False` — re-iterating a shuffled
+      loader would advance its generator and give each width different images.
+    """
+
+    def __init__(self, data_yaml: str, imgsz: int, batch: int, n_batches: int,
+                 seed: int = 0):
+        from ultralytics.cfg import get_cfg
+        from ultralytics.data.build import build_yolo_dataset
+        from ultralytics.data.utils import check_det_dataset
+
+        data = check_det_dataset(data_yaml)
+        cfg = get_cfg()
+        cfg.imgsz = imgsz
+        cfg.rect = False
+        # mode="val" -> deterministic letterbox, no augmentation. We want the
+        # train *distribution*, not train-time augmentation.
+        ds = build_yolo_dataset(cfg, data["train"], batch, data, mode="val",
+                                stride=32)
+        g = torch.Generator().manual_seed(seed)
+        want = min(n_batches * batch, len(ds))
+        idx = torch.randperm(len(ds), generator=g)[:want].tolist()
+        self._loader = torch.utils.data.DataLoader(
+            torch.utils.data.Subset(ds, idx),
+            batch_size=batch, shuffle=False, num_workers=8,
+            collate_fn=getattr(ds, "collate_fn", None), drop_last=True,
+        )
+        self.n_batches = len(self._loader)
+
+    def __len__(self):
+        return self.n_batches
+
+    def __iter__(self):
+        for b in self._loader:
+            yield b["img"].float() / 255.0
 
 
 def fresh_planned_model(weights: str, device):
@@ -108,7 +128,9 @@ def main() -> int:
                     default=[1.0, 0.875, 0.75, 0.625, 0.5])
     ap.add_argument("--calib-batches", type=int, default=200)
     ap.add_argument("--batch", type=int, default=32)
-    ap.add_argument("--momentum", type=float, default=0.02)
+    ap.add_argument("--momentum", type=float, default=None,
+                    help="EMA momentum; omit for a cumulative average (correct "
+                         "for a one-shot recal over a fixed batch set)")
     ap.add_argument("--device", default="0")
     ap.add_argument("--out", default="/root/gate_a.json")
     args = ap.parse_args()
@@ -118,8 +140,9 @@ def main() -> int:
 
     print("building calibration batches from the TRAIN split "
           f"({args.calib_batches} x {args.batch})...", flush=True)
-    calib = build_calib_batches(args.data, 640, args.batch, args.calib_batches, device)
-    print(f"  got {len(calib)} batches", flush=True)
+    calib = CalibBatches(args.data, 640, args.batch, args.calib_batches)
+    print(f"  {len(calib)} batches ({len(calib) * args.batch} images), "
+          "streamed and identical for every width", flush=True)
 
     results = {}
 
@@ -131,6 +154,7 @@ def main() -> int:
           flush=True)
     results["baseline_stock"] = base
     del y0
+    torch.cuda.empty_cache()
 
     # ---- 1. recal sanity gate at w=1.0 ------------------------------------
     print("\n" + "=" * 66)
@@ -152,6 +176,7 @@ def main() -> int:
     results["recal_w1.0"] = recal_full
     results["recal_sanity_pass"] = bool(sane)
     del y, model
+    torch.cuda.empty_cache()
 
     if not sane:
         print("\nRecal procedure is not faithful at w=1.0 — every w<1 number "
@@ -177,6 +202,7 @@ def main() -> int:
         print(f"  w={w:<6} params={params:5.2f}M  mAP={m:.4f}  bar={bar:.4f}  "
               f"{'ABOVE' if m > bar else 'below'}", flush=True)
         del y, model
+        torch.cuda.empty_cache()
 
     print("\n" + header)
     for w, p, m, bar in rows:
