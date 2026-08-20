@@ -74,7 +74,7 @@ class CalibBatches:
     """
 
     def __init__(self, data_yaml: str, imgsz: int, batch: int, n_batches: int,
-                 seed: int = 0):
+                 seed: int = 0, mode: str = "val"):
         from ultralytics.cfg import get_cfg
         from ultralytics.data.build import build_yolo_dataset
         from ultralytics.data.utils import check_det_dataset
@@ -85,7 +85,10 @@ class CalibBatches:
         cfg.rect = False
         # mode="val" -> deterministic letterbox, no augmentation. We want the
         # train *distribution*, not train-time augmentation.
-        ds = build_yolo_dataset(cfg, data["train"], batch, data, mode="val",
+        # mode="val": clean letterbox. mode="train": the same augmentation
+        # pipeline the original BN statistics were accumulated under (mosaic,
+        # scale, flip, HSV), which is a genuinely different distribution.
+        ds = build_yolo_dataset(cfg, data["train"], batch, data, mode=mode,
                                 stride=32)
         g = torch.Generator().manual_seed(seed)
         want = min(n_batches * batch, len(ds))
@@ -131,6 +134,10 @@ def main() -> int:
     ap.add_argument("--momentum", type=float, default=None,
                     help="EMA momentum; omit for a cumulative average (correct "
                          "for a one-shot recal over a fixed batch set)")
+    ap.add_argument("--calib-mode", default="val", choices=["val", "train"],
+                    help="val = clean letterbox; train = the augmentation "
+                         "pipeline the original BN stats were fit under")
+    ap.add_argument("--tolerance", type=float, default=0.010)
     ap.add_argument("--device", default="0")
     ap.add_argument("--out", default="/root/gate_a.json")
     args = ap.parse_args()
@@ -140,9 +147,11 @@ def main() -> int:
 
     print("building calibration batches from the TRAIN split "
           f"({args.calib_batches} x {args.batch})...", flush=True)
-    calib = CalibBatches(args.data, 640, args.batch, args.calib_batches)
+    calib = CalibBatches(args.data, 640, args.batch, args.calib_batches,
+                         mode=args.calib_mode)
     print(f"  {len(calib)} batches ({len(calib) * args.batch} images), "
-          "streamed and identical for every width", flush=True)
+          f"mode={args.calib_mode}, streamed and identical for every width",
+          flush=True)
 
     results = {}
 
@@ -168,11 +177,11 @@ def main() -> int:
     set_width(model, 1.0)
     recal_full = evaluate(y, args.data, args.batch, args.device)
     delta = recal_full - base
-    sane = abs(delta) <= 0.010
+    sane = abs(delta) <= args.tolerance
     print(f"  mAP50-95 @ w=1.0 after recal = {recal_full:.4f} "
           f"(baseline {base:.4f}, delta {delta:+.4f})")
     print(f"  SANITY GATE: {'PASS' if sane else 'FAIL'} "
-          f"(need |delta| <= 0.010)", flush=True)
+          f"(need |delta| <= {args.tolerance:.3f})", flush=True)
     results["recal_w1.0"] = recal_full
     results["recal_sanity_pass"] = bool(sane)
     del y, model

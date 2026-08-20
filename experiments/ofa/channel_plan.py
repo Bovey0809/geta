@@ -286,16 +286,21 @@ def _elastic_bn(
     key = _wkey(w)
 
     if _RECAL["active"]:
+        # Accumulate E[x] and E[x^2] rather than an average of per-batch
+        # variances. Averaging batch variances UNDER-estimates the population
+        # variance, because it discards the between-batch variation of the
+        # mean: Var(x) = E[Var_batch] + Var(E_batch). Accumulating the second
+        # moment is exact for any batch size.
         with torch.no_grad():
             bmean = y.mean(dim=(0, 2, 3))
-            bvar = y.var(dim=(0, 2, 3), unbiased=False)
+            bsq = y.pow(2).mean(dim=(0, 2, 3))
         store = getattr(owner, _STATS, None)
         if store is None:
             store = {}
             setattr(owner, _STATS, store)
         entry = store.get(key)
         if entry is None:
-            store[key] = [bmean.clone(), bvar.clone(), 1]
+            store[key] = [bmean.clone(), bsq.clone(), 1]
         elif _RECAL["momentum"] is None:
             # Cumulative average over all recal batches (the default).
             # A one-shot recal sees a FIXED set of batches, so there is no
@@ -306,11 +311,11 @@ def _elastic_bn(
             entry[2] += 1
             n = entry[2]
             entry[0].add_((bmean - entry[0]) / n)
-            entry[1].add_((bvar - entry[1]) / n)
+            entry[1].add_((bsq - entry[1]) / n)
         else:
             mom = _RECAL["momentum"]
             entry[0].mul_(1.0 - mom).add_(bmean, alpha=mom)
-            entry[1].mul_(1.0 - mom).add_(bvar, alpha=mom)
+            entry[1].mul_(1.0 - mom).add_(bsq, alpha=mom)
             entry[2] += 1
         # normalise with batch stats, as BN train mode would
         return F.batch_norm(y, None, None, weight, bias, training=True,
@@ -318,7 +323,9 @@ def _elastic_bn(
 
     store = getattr(owner, _STATS, None)
     if store is not None and key in store:
-        rm, rv = store[key][0], store[key][1]
+        acc_mean, acc_sq, _ = store[key]
+        rm = acc_mean
+        rv = (acc_sq - acc_mean.pow(2)).clamp_min_(0.0)
     else:
         rm = bn.running_mean[out_sel] if bn.running_mean is not None else None
         rv = bn.running_var[out_sel] if bn.running_var is not None else None
