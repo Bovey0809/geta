@@ -32,9 +32,20 @@ import torch.nn as nn
 _HERE = Path(__file__).resolve()
 sys.path.insert(0, str(_HERE.parent.parent))  # experiments/ofa
 
-from channel_plan import ChannelPlan, install_elastic_conv, set_plans, set_width  # noqa: E402
+from channel_plan import (  # noqa: E402
+    _WIDTH_ATTR,
+    ChannelPlan,
+    install_elastic_conv,
+    set_plans,
+    set_width,
+)
+from plan_builder import plan_c2f  # noqa: E402
 
+from ultralytics.nn.modules.block import C3k2  # noqa: E402
 from ultralytics.nn.modules.conv import Conv  # noqa: E402
+
+sys.path.insert(0, str(_HERE.parent))  # experiments/ofa/tests
+from oracle_util import build_narrow_twin  # noqa: E402
 
 install_elastic_conv()
 
@@ -199,6 +210,123 @@ def test_invariant_fires() -> None:
     check("wrong incoming channel count raises AssertionError", raised)
 
 
+def test_m2_c3k2_bottleneck() -> None:
+    """C3k2 whose .m are Bottlenecks — yolo26s L2 and L4.
+
+    This is the first module where the group structure actually bites: cv1's
+    output feeds `chunk(2, 1)` and cv2's input is a 3-segment concat.
+    """
+    print("\n[M2] C3k2 with Bottleneck (yolo26s L2, L4)")
+    torch.manual_seed(0)
+    # (c1, c2, n, e) mirroring the real blocks, plus an n=2 generalisation
+    cases = [
+        (64, 128, 1, 0.25),   # L2
+        (128, 256, 1, 0.25),  # L4
+        (128, 128, 1, 0.5),   # e=0.5 shape family
+        (64, 128, 2, 0.5),    # n=2: 4 concat segments
+    ]
+    for c1, c2, n, e in cases:
+        wide = C3k2(c1, c2, n, False, e).eval()
+        randomize_bn(wide)
+        in_plan = ChannelPlan((c1,))
+        out_plan = plan_c2f(wide, in_plan)
+
+        tag = f"C3k2({c1}->{c2},n{n},e{e})"
+        check(f"{tag} cv2 in_plan has {2 + n} segments",
+              len(getattr(wide.cv2, "_ofa_in_plan").groups) == 2 + n,
+              f"got {getattr(wide.cv2, '_ofa_in_plan').groups}")
+        check(f"{tag} cv1 out_plan is two equal groups",
+              getattr(wide.cv1, "_ofa_out_plan").groups == (wide.c, wide.c))
+
+        for w in WIDTHS:
+            twin = build_narrow_twin(wide, w)
+            x = torch.randn(2, in_plan.active(w), 16, 16)
+            set_width(wide, w)
+            with torch.no_grad():
+                got = wide(x)
+                want = twin(x)
+            check(f"{tag} w={w} shape",
+                  got.shape == want.shape, f"{tuple(got.shape)} vs {tuple(want.shape)}")
+            if got.shape == want.shape:
+                d = (got - want).abs().max().item()
+                check(f"{tag} w={w} equals narrow twin", d < ATOL, f"max|diff|={d:.3e}")
+            check(f"{tag} w={w} out channels == out_plan.active",
+                  got.shape[1] == out_plan.active(w),
+                  f"{got.shape[1]} vs {out_plan.active(w)}")
+
+
+def _legacy_contiguous_forward(self: Conv, x: torch.Tensor) -> torch.Tensor:
+    """The OLD (broken) slicing: one contiguous prefix, ignoring group structure."""
+    w = getattr(self, _WIDTH_ATTR, 1.0)
+    conv, bn = self.conv, self.bn
+    if w >= 1.0:
+        return self.act(bn(conv(x)))
+    out_k = max(1, int(round(conv.out_channels * w)))
+    in_k = x.shape[1]
+    weight = conv.weight[:out_k, :in_k]
+    y = torch.nn.functional.conv2d(x, weight, None, conv.stride, conv.padding,
+                                   conv.dilation, 1)
+    y = torch.nn.functional.batch_norm(
+        y, bn.running_mean[:out_k], bn.running_var[:out_k],
+        bn.weight[:out_k], bn.bias[:out_k], training=False,
+        momentum=0.1, eps=bn.eps)
+    return self.act(y)
+
+
+def test_legacy_slicing_fails_the_oracle() -> None:
+    """Regression guard: the ORIGINAL contiguous slicing must FAIL this oracle.
+
+    If it passed, the oracle would have no teeth and would not have caught the
+    bug that invalidated the previous study. It must fail on C3k2 (which has
+    internal group structure) while still passing on a plain Conv (single group,
+    where a contiguous prefix happens to be correct — which is exactly why the
+    bug hid for so long).
+    """
+    print("\n[regression] the old contiguous slicing must FAIL the oracle")
+    torch.manual_seed(0)
+    good_forward = Conv.forward
+    try:
+        # -- plain Conv: legacy slicing is CORRECT here (single group) --
+        conv = Conv(64, 128, 3, 2).eval()
+        randomize_bn(conv)
+        set_plans(conv, ChannelPlan((64,)), ChannelPlan((128,)))
+        twin = build_narrow_twin(conv, 0.5)
+        x = torch.randn(2, 32, 16, 16)
+        Conv.forward = _legacy_contiguous_forward
+        set_width(conv, 0.5)
+        with torch.no_grad():
+            d_conv = (conv(x) - twin(x)).abs().max().item()
+        Conv.forward = good_forward
+        check("legacy slicing still OK for single-group Conv (why it hid)",
+              d_conv < ATOL, f"max|diff|={d_conv:.3e}")
+
+        # -- C3k2: legacy slicing must be WRONG --
+        blk = C3k2(128, 256, 1, False, 0.25).eval()
+        randomize_bn(blk)
+        plan_c2f(blk, ChannelPlan((128,)))
+        twin2 = build_narrow_twin(blk, 0.5)
+        x2 = torch.randn(2, 64, 16, 16)
+        Conv.forward = _legacy_contiguous_forward
+        set_width(blk, 0.5)
+        with torch.no_grad():
+            legacy_out = blk(x2)
+            want = twin2(x2)
+        Conv.forward = good_forward
+        d_legacy = (legacy_out - want).abs().max().item()
+        check("legacy slicing FAILS on C3k2 (the real bug, now caught)",
+              d_legacy > 1e-3, f"max|diff|={d_legacy:.3e} (should be large)")
+
+        # -- and the fixed path passes on the same block --
+        set_width(blk, 0.5)
+        with torch.no_grad():
+            d_fixed = (blk(x2) - want).abs().max().item()
+        check("ChannelPlan slicing PASSES on the same C3k2",
+              d_fixed < ATOL, f"max|diff|={d_fixed:.3e}")
+        print(f"        legacy err {d_legacy:.3e}  vs  fixed err {d_fixed:.3e}")
+    finally:
+        Conv.forward = good_forward
+
+
 def main() -> int:
     print("=" * 68)
     print("elastic == narrow oracle")
@@ -206,6 +334,8 @@ def main() -> int:
     test_plan_semantics()
     test_invariant_fires()
     test_m1_plain_conv()
+    test_m2_c3k2_bottleneck()
+    test_legacy_slicing_fails_the_oracle()
     print("\n" + "=" * 68)
     print(f"{_PASSES} passed, {len(_FAILURES)} failed")
     for f in _FAILURES:
