@@ -2,10 +2,18 @@
 
 **Goal:** shrink Ultralytics YOLO26 (fewer params / FLOPs) while holding COCO mAP50-95,
 via GETA structured pruning and, later, Once-for-All (OFA) elastic sub-networks.
-**Answer: no — YOLO26 has no redundant capacity to remove.** Two independent compression
-paradigms hit the same wall. You are consistently better off picking the right-sized
-default model. The framework value delivered is the (non-trivial) engineering to run these
-methods on YOLO26 at all, plus the evidence below.
+**Answer (as of the pruning + KD work): no via structured pruning — yolo26 has little
+redundant capacity to remove, and post-hoc KD of a right-sized student doesn't beat its
+own baseline.** You are consistently better off picking the right-sized default model.
+
+> **⚠ RETRACTION (2026-08-20) — width-elastic OFA is NOT a settled dead end.**
+> Paradigm 3 below previously claimed width-elastic OFA hit "the same wall". That was
+> wrong: its `0.0 mAP` is now traced to **two confirmed implementation bugs** (internal
+> `chunk`/`cat` boundary violation under first-k slicing; shared BN running-stat
+> corruption across widths) — not to a capacity limit. The question is **reopened**.
+> See `ofa/OFA_SUPERNET_PLAN.md` for the evidence and the corrected plan.
+> The depth-elastic `0.0` (Paradigm 2) is consequently **also suspect**.
+> **Paradigm 1 (pruning) still stands** — it had a real 50-epoch full-COCO fine-tune.
 
 Hardware: single **RTX PRO 6000 Blackwell 96 GB** (final runs); earlier work on RTX 3080 Ti 12 GB.
 COCO val2017, mAP50-95, imgsz 640.
@@ -59,7 +67,66 @@ one's function (at λ=10 the KD term dominated the loss and d=1 still didn't mov
 best case is a mediocre sub-net at only −13 % FLOPs. The d=1 forward itself is correct
 (finite outputs, right shape) — the ceiling is fundamental, not a bug.
 
-## Paradigm 3 — knowledge distillation x→m (method improved; fine-tune recipe capped)
+## Paradigm 3 — width-elastic OFA (**RETRACTED — was two bugs, question reopened**)
+> The narrative below is kept for the record, but its conclusion is **withdrawn**.
+> The `0.0 mAP` was caused by (A) naive first-k slicing violating the internal
+> `chunk(2,1)`/`cat` boundaries inside every C3k2/C3k/SPPF block — 23 sites, proven
+> numerically — and (B) `bn.running_mean[:k]` being a *view*, so every train-mode
+> narrow pass (including the `no_grad` teacher) overwrote the inner region of all
+> ~60 elastic BN buffers. Tell-tale: kd=10 and kd=1000 collapsed identically, which
+> a gradient-magnitude explanation cannot account for. Corrected plan + evidence:
+> `ofa/OFA_SUPERNET_PLAN.md`.
+
+Make yolo26s width-elastic (each Conv slices its output channels by a global
+`_active_width` ∈ (0, 1]; `width_elastic.py`) so w=1.0 recovers the pretrained
+0.472 baseline and w<1.0 is a shrunk sub-net. Target: an n↔s width supernet
+(n and s share depth=0.50, differ only in width). All the correctness plumbing
+was implemented and PoC-verified:
+
+- **PoC (5/5 checks pass, `width_poc.py`):** bit-identical forward at w=1.0
+  (max_abs_diff = 0.0), non-crash finite forward at w=0.5, mAP=0.4717 at w=1.0,
+  gradient flow only in the `[:out_k, :in_k]` weight slice (weight-sharing verified).
+- **Untrained subnet at w=0.5: 0.0000 mAP**, exactly matching the depth-elastic
+  outcome — the sliced first-k channels aren't in any semantically meaningful
+  order in the pretrained net.
+- **Progressive-shrinking training tried three ways.** All failed:
+  1. Sandwich [1.0, 0.75], grad-tracked teacher + student + KD (λ=10): 3 ep at
+     fraction=0.1 → student stayed at 0.0; teacher's gradient fought student's
+     on the shared `weight[:0.75, :0.75]` region.
+  2. Same widths, **`no_grad` teacher** (OFA-MIT in-place-KD pattern): 3 ep at
+     fraction=0.1 → w=1.0 collapsed **0.472 → 0.0001** (student grad shifted
+     shared inner weights, breaking the outer teacher context); w=0.75 still 0.0.
+  3. Narrow-gap diagnostic [1.0, 0.95] with kd=1000: same collapse (0.472 → 0.005)
+     in 74 batches. Even 5% width step + KD-dominant loss couldn't hold the teacher.
+- **BN recalibration alone (`bn_recal.py`):** untrained sub-net at w=0.5 stayed
+  at 0.0; recalibration at w=1.0 on val-distribution stats actually *dropped*
+  it to 0.345 (val ≠ train distribution).
+
+Also fixed three real Ultralytics/YOLO26 interactions on the way (all shipped):
+- **Concat channel alignment** at two-elastic-source neck concats (yolo26s
+  model.16, model.19): naive `weight[:, :in_k]` mixed source-A columns into
+  source-B territory; wrote `prepare_concat_alignment` for per-source column
+  slicing.
+- **Ultralytics `save_model` writes `ema.ema` unconditionally.** With EMA
+  disabled, `ema.ema` stays at initial state → `last.pt` was byte-identical
+  to `yolo26s.pt` after 3 epochs of "training." Fix: `on_train_epoch_end`
+  callback syncing `ema.ema` from the live model.
+- **C2PSA's `split((self.c, self.c), 1)` is width-hostile** — `self.c` is baked
+  at init. Replaced with `chunk(2, 1)`.
+
+**Root cause is the same as depth-elastic:** the pretrained net's channel
+ordering is arbitrary, so first-k slicing keeps an arbitrary subset. To make
+first-k meaningful requires importance-based channel sorting AND long
+progressive-shrinking training (100+ ep on full COCO with per-width BN
+recal) — the full OFA-MIT recipe. We wrote scaffolding for the sorting
+step (`channel_sort.py`) but stopped before completing the module-by-module
+graph walking needed to keep bit-identity through all of yolo26's attention
+blocks, Concat consumers, Bottleneck residuals, and Detect branches. The
+CONCLUSION doesn't change: yolo26 has no channels the pretrained network
+doesn't use, so even a correct implementation is unlikely to produce a
+sub-net that beats the free default (n at 0.395).
+
+## Paradigm 4 — knowledge distillation x→m (method improved; fine-tune recipe capped)
 Instead of removing capacity, add a teacher: Ultralytics' built-in KD
 (`distill_model=`, score-weighted-L2 neck-feature loss) distilling x (0.5626) into a
 full-size m (20.4 M, default 0.518). We implemented and ablated three improvements
@@ -79,14 +146,23 @@ terms hurts. But the full 40-epoch CWD run reached only **0.5031 — below defau
 baseline (8-ep screening ≈ 40-ep run). The honest remaining test is KD during **full
 from-scratch training** (~500 ep, ~100 h+) — untested here.
 
-## Unified conclusion
-Structured pruning (remove channels) and depth-elastic OFA (remove blocks) both delete
-capacity that YOLO26 actually uses, and neither fine-tuning nor knowledge distillation
-recovers it. Post-hoc KD-fine-tuning of a right-sized student doesn't lift it above its
-own baseline either. **YOLO26 is Pareto-efficient across its n/s/m/l/x family — the
-right-sized default beats every cheap post-hoc size/accuracy intervention we tried.**
-The one method improvement that survived controlled testing: **CWD channel-wise KL beats
-the stock score-weighted L2 in Ultralytics' distillation loss** (upstream candidate).
+## Unified conclusion (revised 2026-08-20)
+**What holds:** structured pruning deletes capacity YOLO26 actually uses and a
+50-epoch full-COCO fine-tune recovers only ~80 % of dense-x (0.450 at default-m's
+param count vs m's 0.518). Post-hoc KD-fine-tuning of a right-sized student
+doesn't lift it above its own baseline either. For **these** interventions, the
+right-sized default wins.
+
+**What does NOT hold:** the stronger claim that YOLO26 is Pareto-efficient against
+*any* cheap intervention. Both elastic-OFA "dead ends" were measured with buggy
+slicing (and, for width, corrupted BN statistics), so they are **not evidence**
+about capacity. Width-elastic is reopened (`ofa/OFA_SUPERNET_PLAN.md`); depth-elastic
+deserves one re-test.
+
+The one method improvement that survived controlled testing: **CWD channel-wise KL
+beats the stock score-weighted L2 in Ultralytics' distillation loss** (upstream
+candidate) — though it loses on the official O365→COCO pipeline, so the gain is
+regime-specific.
 
 ### What *does* give "faster at the same mAP"
 **TensorRT FP16 on the dense model** — lossless, −37 to −41 % GPU latency, no mAP change
@@ -97,5 +173,10 @@ YOLO26 (attention / concat / NMS-free head don't INT8-fuse).
 - Pruning: `geta_yolo26/prune_finetune.py`, `geta_trainer.py`, `profile_pruned_x.py`
   (+ GETA graph fixes in `only_train_once/`). Result: `out/geta_x_s50_full/pruned_val.json`,
   `out/yolo26x_pruned_profile.json`.
-- OFA: `ofa/elastic_yolo26.py`, `sandwich_train.py`, `sandwich_kd_train.py`, `ofa_eval.py`,
-  `inspect_depth.py`, `calib_kd.py`.
+- Depth-elastic OFA: `ofa/elastic_yolo26.py`, `sandwich_train.py`, `sandwich_kd_train.py`,
+  `ofa_eval.py`, `inspect_depth.py`, `calib_kd.py`.
+- Width-elastic OFA: `ofa/width_elastic.py` (Conv/Concat/C2PSA patches + Concat alignment),
+  `width_poc.py` (5-check PoC), `width_sandwich_train.py` (in-place KD sandwich),
+  `width_eval.py`, `bn_recal.py`, `channel_sort.py` (partial). Full write-up in
+  `ofa/OFA_WIDTH_RESULTS.md`.
+- KD improvements: `distill/improved_distill.py`, `improved_distill_train.py`.

@@ -42,3 +42,15 @@ differ from d=2 by ~100% relative MSE (P3 0.58, P4 0.99, P5 1.12) -> the "elasti
 is ESSENTIAL computation, not residual refinement. KD can't make a lower-capacity net reproduce a
 higher-capacity one (at lambda=10 KD dominated the loss; d=1 still didn't move). d=1 forward is
 correct (finite, right shape) -- the ceiling is fundamental, not a bug. See ../CONCLUSION.md.
+
+> **CAVEAT ADDED 2026-08-20 — "fundamental, not a bug" is no longer safe to assert.**
+> The sibling width-elastic study made exactly this claim and it turned out to be two
+> implementation bugs (see OFA_SUPERNET_PLAN.md). Two specific reasons to re-test d=1:
+> (1) both dropped bottlenecks are `add=True` **residual** blocks, and dropping a residual
+> block should degrade *gracefully* -- `y = x + f(x)` becoming `y = x` giving EXACTLY 0.0
+> mAP across 14 blocks is the same "suspiciously total" signature the width bugs had;
+> (2) d=1 was evaluated with **full-depth BN running stats** and no recalibration, and the
+> width study proved that mismatched BN statistics alone are enough to destroy a subnet.
+> The ~100% feature MSE is consistent with *either* a real capacity ceiling *or* an
+> un-recalibrated distribution shift -- it does not discriminate between them.
+> One cheap re-test (correct slicing + per-width BN recal) would settle it.

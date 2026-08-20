@@ -1,0 +1,300 @@
+# Plan — make the yolo26s width-elastic OFA supernet actually work
+
+**Status:** the previous width-elastic attempt's `0.0 mAP` was **two implementation bugs,
+not a capacity limit.** Both are now confirmed by direct measurement (below). The
+"three paradigms, same wall" claim in `CONCLUSION.md` was premature for width-elastic
+and has been corrected.
+
+**Goal:** one yolo26s supernet, dial `w ∈ [0.5, 1.0]`, get a usable detector at every
+point from a single training run.
+
+**Honest framing of the win:** the product is the **intermediate widths** (w ≈ 0.6–0.85),
+which are Pareto points that *do not exist* in the n/s/m/l/x family. w=0.5 beating
+yolo26n's free 0.395 is the stretch goal, not the bar.
+
+| w | ~params | target mAP50-95 | note |
+|---|---|---|---|
+| 1.000 | 9.5 M | 0.472 | must stay = default s |
+| 0.875 | ~7.5 M | ≥ 0.45 | **new Pareto point** |
+| 0.750 | ~5.8 M | ≥ 0.43 | **new Pareto point** |
+| 0.625 | ~4.3 M | ≥ 0.41 | **new Pareto point** |
+| 0.500 | ~3.1 M | ≥ 0.395 | stretch: beat default n |
+
+(param numbers are estimates pending the P0 measurement; attention blocks stay
+full-width until P5, so the real curve is flatter than pure w² scaling.)
+
+---
+
+## Part 1 — What was actually broken (both confirmed, not hypotheses)
+
+### Bug A — naive first-k slicing violates every internal `chunk`/`cat` boundary
+
+`C2f.forward` (which `C3k2` inherits) is:
+```python
+y = list(self.cv1(x).chunk(2, 1))      # cv1 outputs 2*c; SEMANTIC boundary at index c
+y.extend(m(y[-1]) for m in self.m)
+return self.cv2(torch.cat(y, 1))       # cv2 input = (2+n) segments of c
+```
+Elastic slicing took `cv1`'s output as trained channels `[0, out_k)` with
+`out_k = round(2c·w)`, then let `chunk(2,1)` split *that*. Measured on a real
+`C3k2(256→256, c=128)`:
+
+```
+c=128  w=0.5  out_k=128  k1=64
+naive halfA == correct halfA ?  True
+naive halfB == correct halfB ?  False      max|diff| = 2.2959
+naive halfB == cv1_full[:, 64:128] (i.e. STILL INSIDE semantic half 1)?  True
+```
+
+At `w=0.5` the residual branch receives channels drawn **entirely from the first
+semantic half**. At `w=0.95` the second half straddles the boundary. This is wrong
+at *every* `w < 1.0`:
+
+| w | out_k | halfA | halfB | halfB polluted by semantic-half-1 |
+|---|---|---|---|---|
+| 1.00 | 256 | [0,128) | [128,256) | no |
+| 0.95 | 243 | [0,121) | [121,243) | **yes** |
+| 0.75 | 192 | [0,96) | [96,192) | **yes** |
+| 0.50 | 128 | [0,64) | [64,128) | **yes (entirely)** |
+
+The same violation applies to every internal concatenation. Full site count in
+yolo26s: **23 distinct structural violation sites** (table in Part 3). Cascading
+corruption through 23 sites fully explains `0.0 mAP`, and explains why even
+`w=0.95` was destroyed.
+
+`PoC check 1` (bit-identity at `w=1.0`) passed because at `w=1.0` nothing is
+sliced. `PoC check 2` (finite output at `w=0.5`) passed because shapes still
+work out — only the semantics are wrong. **There was never a per-module
+correctness oracle.** That is the single most important thing this plan adds.
+
+### Bug B — shared BN running stats are corrupted across widths
+
+`_elastic_conv_forward` passes `bn.running_mean[:out_k]` to `F.batch_norm`. A basic
+slice is a **view sharing storage**, and `F.batch_norm(training=True)` updates running
+stats **in place**. Measured on `model.4.cv1.bn` (128 ch):
+
+```
+[eval  mode, w=0.5]                buffer changed: False
+[train mode, w=0.5, under no_grad] running_mean[:64] changed: True   <-- CORRUPTION
+                                   running_mean[64:] changed: False  <-- stale
+```
+
+`torch.no_grad()` does **not** prevent buffer mutation. So during sandwich training
+every student pass — *and the "frozen teacher" pass* — rewrote the inner region of
+all ~60 elastic BN buffers with narrower-width statistics, leaving the outer region
+at full-width statistics. The `ema.ema` sync callback then saved those mixed buffers.
+
+**This retrodicts the observed failures exactly:**
+
+| run | what happened | explained by |
+|---|---|---|
+| (a) grad teacher, kd=10 | "teacher preserved 0.4716" | the EMA-save bug meant `last.pt` was byte-identical to pretrained — we evaluated **untrained** weights |
+| (b) `no_grad` teacher, kd=10 | teacher **0.472 → 0.0001** | corrupted BN buffers now actually saved |
+| (c) narrow gap, **kd=1000** | teacher **0.472 → 0.0052** | ~same collapse at 100× the KD weight |
+
+(c) is the decisive tell: a **100× change in KD weight barely moved the outcome**.
+A gradient-magnitude problem would have responded strongly. BN-buffer corruption is
+KD-weight-independent. The "student gradients destroy the teacher" story was wrong.
+
+### Also invalid: the earlier BN-recalibration result
+
+`bn_recal.py` reported `w=1.0` recal → **0.345** (down from 0.472). A correct recal
+procedure at `w=1.0` must return ≈0.472 by construction. So that run's procedure was
+broken (calibrated on **val** images; `momentum=None` crashed and was replaced with
+the default 0.1 without re-validating). Every `w<1.0` zero from that run is
+**uninterpretable**. Recal must be re-run with its own sanity gate.
+
+### One line on depth-elastic
+
+The depth-elastic `0.0` (dropping 1 of 2 `add=True` residual bottlenecks per C3k) is
+now **also suspect** — dropping a residual block should degrade gracefully, and it was
+evaluated with full-net BN stats. Worth one re-test after this work, not a workstream.
+**The pruning result (Paradigm 1) still stands** — it had a real 50-epoch fine-tune.
+
+---
+
+## Part 2 — Core design: `ChannelPlan` (replaces the global "take first k")
+
+A single global width scalar with contiguous `[:k]` slicing cannot express any of
+the structures above. Replace it with an explicit per-tensor channel layout.
+
+```python
+@dataclass
+class ChannelPlan:
+    groups: tuple[int, ...]   # full size of each semantic group, in order
+    # offsets are the running prefix sums of `groups`
+
+    def select(self, w: float) -> torch.Tensor:
+        """Indices to keep at width w: the first round(g*w) of EACH group."""
+```
+
+Every `Conv` carries `in_plan` and `out_plan`. Slicing becomes:
+
+```python
+out_sel = self.out_plan.select(w)          # group-structured, may be non-contiguous
+in_sel  = self.in_plan.select(w)           # from the producer's out_plan
+weight  = conv.weight[out_sel][:, in_sel]
+bn_*    = bn.<param>[out_sel]              # SAME out_sel as the conv rows
+```
+
+Two properties this buys:
+
+1. **`chunk`/`split` keep working.** `C3k2.cv1.out_plan = (c, c)` → at width `w` the
+   output is `[k1 | k1]` with `k1 = round(c·w)`, so `chunk(2,1)` splits at exactly the
+   right place, by construction. No forward-code changes needed in the block.
+2. **Residual ties are expressible.** `Bottleneck.cv2.out_plan` is *the same object* as
+   the bottleneck's `in_plan`, so `x + cv2(cv1(x))` always lines up.
+
+**Consequence to handle in P4:** group-structured selection uses *advanced* indexing,
+which returns a **copy**, not a view. So Bug B disappears automatically — but so does
+any ability for BN stats to update through the slice. BN therefore needs **explicit
+per-width buffers** (P4), not incidental view-writes.
+
+---
+
+## Part 3 — Module-by-module work list (the spine)
+
+Verified inventory of yolo26s (24 top-level layers). Every row is one unit of work
+with its own oracle test.
+
+| # | layer(s) | type | internal channel structure | plans / constraints |
+|---|---|---|---|---|
+| M1 | 0,1,3,5,7,17,20 | `Conv` | none | `out_plan=(C,)`; baseline case |
+| M2 | 2,4 | `C3k2`, `m=[Bottleneck]` | `cv1` chunk2@c; `cv2` in = 3 segs of c | `cv1.out=(c,c)`; `cv2.in=(c,c,c)`; Bottleneck `add=True` → `cv2.out ≡ block.in` |
+| M3 | 6,8,13,16,19 | `C3k2`, `m=[C3k]` | as M2, **plus** nested `C3k`: `cv3` in = 2 segs of `c_`, 2 Bottlenecks both `add=True` | nested plans; both inner bottlenecks tie out≡in |
+| M4 | 9 | `SPPF` | `cv2` in = **4 repeated** segs of `c_`; `n=3`; **`add=True` → `y + x`** | `cv2.in=(c_,)*4`; **`out_plan ≡ block.in_plan`** (hardest constraint) |
+| M5 | 12,15,18,21 | `Concat` | inter-layer, per-source | already done (`prepare_concat_alignment`) — port to `ChannelPlan` |
+| M6 | 23 | `Detect` | 4 branch families × 3 scales, first-conv `in_c` = [128,256,512] | per-scale `in_plan` from sources 16/19/22; **`out_plan` fixed** (nc+reg·4) |
+| M7 | 10 | `C2PSA` | `cv1` split2@c + attention | **frozen** until P5 |
+| M8 | 22 | `C3k2 attn`, `m=[Seq(Bottleneck,PSABlock)]` | `cv1` chunk2@c; `cv2` 3 segs; PSABlock attention | **frozen** until P5 (costs the whole P5 branch — 512 ch) |
+
+**Violation-site count:** 8 (`C3k2.cv1` chunk) + 8 (`C3k2.cv2` cat) + 5 (`C3k` cv3 cat)
++ 1 (`SPPF` repeated cat) + 1 (`SPPF` residual) = **23**, plus every Bottleneck residual.
+
+### The oracle test — what was missing all along
+
+For each module type, standalone, random weights, CPU, seconds to run:
+
+```python
+def assert_elastic_equals_narrow(module_factory, w):
+    """The strong test: elastic-wide-at-w must EQUAL a genuinely narrow module
+    built by gathering the corresponding channels out of the wide weights."""
+    wide   = module_factory(full_width)
+    narrow = module_factory(scaled_width)          # a real, natively-narrow module
+    copy_gathered_weights(wide -> narrow, w)       # gather via ChannelPlan.select
+    set_width(wide, w)
+    assert allclose(wide(x), narrow(x), atol=1e-6)
+```
+
+This is exact, not approximate: a correctly group-sliced elastic module is
+*definitionally* the same computation as the narrow module with those weights.
+It turns "the whole net gives 0.0, shrug" into "M3's inner C3k cv3 fails at w=0.75".
+
+Plus the standing invariant, re-checked after every module lands:
+**bit-identity at `w=1.0`** (`max_abs_diff == 0.0`).
+
+### Localization harness
+
+`set_layer_width(model, idx, w)` — make **one** top-level layer elastic, rest at 1.0.
+Sweep 24 layers × w ∈ {0.9, 0.75, 0.5} → mAP table (~24 × 15 s ≈ 6 min/width on GPU).
+Any future `0.0` becomes a pointed bug report instead of a shrug. Keep this permanently.
+
+---
+
+## Part 4 — Phases and gates
+
+Gates are falsifiable stop conditions. **If a gate fails, we stop and report — no
+"one more try".**
+
+### P0 — Correct the record + build the harness *(0.5 h, local)*
+- Fix `CONCLUSION.md` Paradigm 3 and the project memory: the width-elastic `0.0` was
+  Bugs A+B, not capacity. ✅ *done in this pass*
+- `set_layer_width()` localization harness; measure real per-width param counts.
+
+### P1 — `ChannelPlan` + module-by-module correctness *(6–8 h, **local CPU, ¥0**)*
+Land M1 → M6 in order, each with its oracle test green and `w=1.0` bit-identity held.
+No GPU, no COCO, no rental. **This is the bulk of the work and it is free.**
+- Exit criterion: all oracle tests pass for w ∈ {0.875, 0.75, 0.625, 0.5}.
+
+### P2 — Recal sanity + first real measurement → **GATE A** *(1–2 h GPU, ~¥5)*
+- **Recal sanity gate first:** recal at `w=1.0` must return **≈0.472**. Use
+  **train2017** images through the val-style loader, fixed small momentum (≈0.02),
+  200+ batches. If this doesn't return ≈0.472 the procedure is still broken — fix
+  before reading any `w<1` number.
+- Then whole-net mAP at w ∈ {0.875, 0.75, 0.5}, **with recal**, no sorting, no training.
+- **GATE A: does `w=0.875` give > 0.20 mAP?**
+  Correct slicing + correct stats should leave a converged net degraded-but-alive when
+  12.5% of channels are dropped. Still `0.0` ⇒ something structural remains; stop and
+  reassess rather than pile on training.
+
+### P3 — Importance-based channel sorting → **GATE B** *(4–6 h local + 1 h GPU)*
+Per-**group** `argsort` by effective post-fusion scale `|γ| / sqrt(running_var + ε)`,
+propagated to every consumer's input columns.
+- Residual ties (`Bottleneck.cv2.out ≡ block.in`, `SPPF.out ≡ SPPF.in`) merge groups
+  into **equivalence classes that share one permutation**. The earlier global-permutation
+  attempt broke on exactly this (bit-identity diverged to `6.8e+02`).
+- Invariant after sorting: **bit-identity at `w=1.0` still `0.0`** (a consistent
+  permutation is a relabeling, i.e. a no-op).
+- **GATE B: does sorting improve every width vs. P2, and does `w=0.75` clear 0.30?**
+
+### P4 — Per-width BN *(2 h)*
+Group-structured gather returns copies, so BN stats can no longer update through the
+slice. Add explicit per-width buffers (slimmable-networks switchable-BN pattern):
+share `γ`/`β`, keep separate `running_mean`/`running_var` per width in the elastic set.
+- **GATE C: `w=0.75` ≥ 0.35 with no weight training at all.**
+
+### P5 — *(optional)* attention elasticity, unlocks "the whole network shrinks"
+`C2PSA` (L10) and `C3k2-attn` (L22) are frozen at full width, and L22 is the entire
+P5 head (512 ch) — this is where the remaining savings are.
+Design: keep `head_dim`/`key_dim` **fixed** and scale **`num_heads`**, so every retained
+head stays intact. Then `qkv.out_plan = (2·key_dim + head_dim,) * num_heads` and width
+selects the first `round(num_heads·w)` **whole groups** — it drops straight into
+`ChannelPlan` with no special-casing. `proj.out_plan ≡ block.in_plan` (PSABlock residual).
+**Deferred until Gates A–B pass.**
+
+### P6 — Progressive-shrinking training → **GATE D** *(10–25 h GPU, ~¥100–250)*
+Only meaningful once subnets *start* healthy — that's what makes gradients sane and is
+why the earlier training could never have worked.
+- Staged widths, never introduce a width whose current mAP is near zero:
+  `{1.0}` → `{1.0, 0.875}` → `{1.0, 0.875, 0.75}` → … → `{1.0 … 0.5}`
+- In-place KD (teacher `no_grad`, features as targets) — the pattern was right, its
+  inputs were broken.
+- Low lr (1e-5 … 1e-4), per-width BN active, EMA-save workaround in place.
+- **GATE D: intermediate widths land above the straight n→s interpolation line**
+  (the actual product), and ideally `w=0.5 > 0.395`.
+
+---
+
+## Part 5 — Cost and sequencing
+
+| phase | where | wall time | GPU ¥ |
+|---|---|---|---|
+| P0 | local | 0.5 h | 0 |
+| P1 | **local CPU** | 6–8 h | **0** |
+| P2 (Gate A) | 4090 ×1 | 1–2 h | ~5 |
+| P3 (Gate B) | local + 4090 | 5–7 h | ~5 |
+| P4 (Gate C) | 4090 ×1 | 2 h | ~5 |
+| P5 (opt) | local + 4090 | 4–6 h | ~5 |
+| P6 (Gate D) | 4090 / PRO 6000 | 10–25 h | 100–250 |
+
+**Do not rent a GPU until every P1 oracle test is green.** Everything up to Gate A is
+CPU work runnable on the local `tennis_data_pipeline/.venv` (torch 2.13 CPU +
+ultralytics 8.4.117, already verified). A **¥2/hr RTX 4090 is sufficient** for Gates
+A–C — the PRO 6000 was overkill and it kept getting idle-reaped between sessions.
+
+**Why this is a different bet than last time:** the previous attempt had no per-module
+correctness oracle, so two structural bugs hid behind a single end-to-end number, and
+every intervention was tuning hyperparameters on top of broken arithmetic. P1 replaces
+that number with ~30 exact per-module assertions, and Gate A reads out the honest
+answer *before* any training spend.
+
+---
+
+## Reproduce the two diagnoses
+
+Both run locally, CPU, in seconds:
+- Bug A: `scratchpad/verify_chunk_bug.py` — chunk-boundary arithmetic + numerical proof
+- Bug B: `scratchpad/verify_bn_corruption.py` — BN buffer mutation under `no_grad`
+- Inventory: `scratchpad/inventory.py` — per-layer internal `cat`/`chunk` structure
+
+(to be promoted into `experiments/ofa/tests/` as part of P1)

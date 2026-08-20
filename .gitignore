@@ -1,8 +1,32 @@
 __pycache__/
 *.pyc
+*.py[cod]
+*.so
+*.egg-info/
+.pytest_cache/
+.ipynb_checkpoints/
+
+# Model weights / checkpoints (large binaries — keep out of git)
 *.pt
+*.pth
 *.onnx
 *.engine
+*.trt
 *.profile
+
+# Training / experiment outputs
+# NOTE: experiments/*/out/ holds small committed result JSONs (e.g.
+# geta_yolo26/out/geta_x_s50_full/pruned_val.json) — do NOT ignore out/.
 runs/
+wandb/
+*.log
 log_vanilla.txt
+
+# Datasets
+coco/
+datasets/
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
