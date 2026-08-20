@@ -76,19 +76,42 @@ class ChannelPlan:
     """An ordered list of semantic channel groups making up one tensor.
 
     `groups` are FULL (width=1.0) sizes. Selection keeps the first
-    `round(g*w)` channels of each group, concatenated in group order.
+    `round(g*w)` channels of each ELASTIC group, and all channels of each
+    FROZEN group, concatenated in group order.
 
     Equality is by value, which is exactly what residual ties need: two tensors
-    that must stay aligned simply carry plans with equal `groups`.
+    that must stay aligned simply carry plans with equal groups+flags.
+
+    Frozen groups exist because attention blocks (C2PSA, C3k2-attn) and the
+    Detect head cannot be sliced yet, so the tensors they emit stay full width
+    even while their neighbours shrink. Without this, a frozen block's output
+    would be sliced by its consumer and the two would disagree.
     """
 
     groups: tuple[int, ...]
+    elastic: tuple[bool, ...] | None = None
 
     def __post_init__(self):
         assert len(self.groups) >= 1, "a plan needs at least one group"
         assert all(isinstance(g, int) and g >= 1 for g in self.groups), (
             f"groups must be positive ints, got {self.groups}"
         )
+        if self.elastic is None:
+            object.__setattr__(self, "elastic", (True,) * len(self.groups))
+        assert len(self.elastic) == len(self.groups), (
+            f"elastic flags {self.elastic} do not match groups {self.groups}"
+        )
+
+    # -- constructors --------------------------------------------------------
+
+    @staticmethod
+    def frozen(total: int) -> "ChannelPlan":
+        """A single group that never shrinks (frozen-block output)."""
+        return ChannelPlan((total,), (False,))
+
+    @property
+    def any_elastic(self) -> bool:
+        return any(self.elastic)
 
     # -- sizes ---------------------------------------------------------------
 
@@ -106,10 +129,13 @@ class ChannelPlan:
         return tuple(out)
 
     def active_groups(self, w: float) -> tuple[int, ...]:
-        """Per-group active sizes at width w."""
+        """Per-group active sizes at width w (frozen groups keep full size)."""
         if w >= 1.0:
             return self.groups
-        return tuple(_round_group(g, w) for g in self.groups)
+        return tuple(
+            g if not el else _round_group(g, w)
+            for g, el in zip(self.groups, self.elastic)
+        )
 
     def active(self, w: float) -> int:
         """Total active channel count at width w."""
@@ -143,19 +169,21 @@ class ChannelPlan:
 
     def __add__(self, other: "ChannelPlan") -> "ChannelPlan":
         """Concatenation: the plan of `cat([a, b], dim=1)`."""
-        return ChannelPlan(self.groups + other.groups)
+        return ChannelPlan(self.groups + other.groups, self.elastic + other.elastic)
 
     @staticmethod
     def cat(plans) -> "ChannelPlan":
         groups: tuple[int, ...] = ()
+        flags: tuple[bool, ...] = ()
         for p in plans:
             groups = groups + p.groups
-        return ChannelPlan(groups)
+            flags = flags + p.elastic
+        return ChannelPlan(groups, flags)
 
     @staticmethod
     def repeat(plan: "ChannelPlan", times: int) -> "ChannelPlan":
         """Plan of `cat([t]*times)` where t has layout `plan` (SPPF pattern)."""
-        return ChannelPlan(plan.groups * times)
+        return ChannelPlan(plan.groups * times, plan.elastic * times)
 
     @staticmethod
     def uniform(total: int, n_groups: int = 1) -> "ChannelPlan":
@@ -229,6 +257,9 @@ def _elastic_forward(self: Conv, x: torch.Tensor) -> torch.Tensor:
         return self.act(self.bn(conv(x)))
 
     in_plan: ChannelPlan = getattr(self, _IN_PLAN)
+    if not (in_plan.any_elastic or out_plan.any_elastic):
+        # fully frozen on both sides -> nothing to slice
+        return self.act(self.bn(conv(x)))
     dev = conv.weight.device
     out_sel = _sel(out_plan, w, dev)
 
@@ -293,6 +324,8 @@ def _elastic_forward_fuse(self: Conv, x: torch.Tensor) -> torch.Tensor:
         return self.act(conv(x))
 
     in_plan: ChannelPlan = getattr(self, _IN_PLAN)
+    if not (in_plan.any_elastic or out_plan.any_elastic):
+        return self.act(conv(x))
     dev = conv.weight.device
     out_sel = _sel(out_plan, w, dev)
 
@@ -327,6 +360,42 @@ def install_elastic_conv() -> None:
     Conv.forward = _elastic_forward
     Conv.forward_fuse = _elastic_forward_fuse
     _INSTALLED = True
+
+
+def count_active_params(model: nn.Module, w: float) -> int:
+    """Parameter count of the sub-network actually executed at width w.
+
+    Planned Convs contribute only their sliced weight/BN parameters; every
+    other parameter (attention internals, Detect heads, unplanned convs) is
+    counted in full, which is honest about the frozen blocks still costing
+    their full size at every width.
+    """
+    counted: set[int] = set()
+    total = 0
+    for m in model.modules():
+        if not (isinstance(m, Conv) and hasattr(m, _OUT_PLAN)):
+            continue
+        in_plan: ChannelPlan = getattr(m, _IN_PLAN)
+        out_plan: ChannelPlan = getattr(m, _OUT_PLAN)
+        c = m.conv
+        if c.groups == 1:
+            out_k, in_k = out_plan.active(w), in_plan.active(w)
+        else:
+            out_k = in_k = in_plan.active(w)
+        kh, kw = c.kernel_size
+        total += out_k * (in_k if c.groups == 1 else 1) * kh * kw
+        counted.add(id(c.weight))
+        if c.bias is not None:
+            total += out_k
+            counted.add(id(c.bias))
+        if isinstance(m.bn, nn.BatchNorm2d):
+            total += 2 * out_k  # weight + bias (running stats are buffers)
+            counted.add(id(m.bn.weight))
+            counted.add(id(m.bn.bias))
+    for p in model.parameters():
+        if id(p) not in counted:
+            total += p.numel()
+    return total
 
 
 def elastic_bn_is_safe() -> str:

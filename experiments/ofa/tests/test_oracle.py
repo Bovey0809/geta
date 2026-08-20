@@ -35,13 +35,14 @@ sys.path.insert(0, str(_HERE.parent.parent))  # experiments/ofa
 from channel_plan import (  # noqa: E402
     _WIDTH_ATTR,
     ChannelPlan,
+    count_active_params,
     install_elastic_conv,
     set_plans,
     set_width,
 )
-from plan_builder import plan_c2f  # noqa: E402
+from plan_builder import plan_c2f, plan_model, plan_sppf  # noqa: E402
 
-from ultralytics.nn.modules.block import C3k2  # noqa: E402
+from ultralytics.nn.modules.block import SPPF, C3k2  # noqa: E402
 from ultralytics.nn.modules.conv import Conv  # noqa: E402
 
 sys.path.insert(0, str(_HERE.parent))  # experiments/ofa/tests
@@ -327,6 +328,140 @@ def test_legacy_slicing_fails_the_oracle() -> None:
         Conv.forward = good_forward
 
 
+def test_m3_c3k2_nested_c3k() -> None:
+    """C3k2 whose .m are C3k — yolo26s L6, L8, L13, L16, L19 (5 of 8 blocks)."""
+    print("\n[M3] C3k2 with nested C3k (yolo26s L6, L8, L13, L16, L19)")
+    torch.manual_seed(0)
+    cases = [
+        (256, 256, 1, 0.5),   # L6
+        (512, 512, 1, 0.5),   # L8
+        (768, 256, 1, 0.5),   # L13 (concat-fed)
+        (512, 128, 1, 0.5),   # L16
+        (384, 256, 1, 0.5),   # L19
+    ]
+    for c1, c2, n, e in cases:
+        wide = C3k2(c1, c2, n, True, e).eval()  # c3k=True -> .m are C3k
+        randomize_bn(wide)
+        inner = wide.m[0]
+        check(f"C3k2({c1}->{c2}) .m[0] is C3k",
+              type(inner).__name__ == "C3k", f"got {type(inner).__name__}")
+        in_plan = ChannelPlan((c1,))
+        out_plan = plan_c2f(wide, in_plan)
+        tag = f"C3k2({c1}->{c2},c3k,e{e})"
+        check(f"{tag} inner cv3 in_plan has 2 segments",
+              len(getattr(inner.cv3, "_ofa_in_plan").groups) == 2,
+              f"got {getattr(inner.cv3, '_ofa_in_plan').groups}")
+
+        for w in WIDTHS:
+            twin = build_narrow_twin(wide, w)
+            x = torch.randn(2, in_plan.active(w), 16, 16)
+            set_width(wide, w)
+            with torch.no_grad():
+                got, want = wide(x), twin(x)
+            if got.shape != want.shape:
+                check(f"{tag} w={w} shape", False,
+                      f"{tuple(got.shape)} vs {tuple(want.shape)}")
+                continue
+            d = (got - want).abs().max().item()
+            check(f"{tag} w={w} equals narrow twin", d < ATOL, f"max|diff|={d:.3e}")
+
+
+def test_m4_sppf() -> None:
+    """SPPF — repeated concat plus the `y + x` residual (yolo26s L9)."""
+    print("\n[M4] SPPF with repeated concat + residual (yolo26s L9)")
+    torch.manual_seed(0)
+    for (c1, c2, n, shortcut) in [(512, 512, 3, True),   # L9, add=True
+                                  (256, 256, 3, True),
+                                  (512, 256, 3, False)]:  # no residual
+        wide = SPPF(c1, c2, 5, n, shortcut).eval()
+        randomize_bn(wide)
+        in_plan = ChannelPlan((c1,))
+        out_plan = plan_sppf(wide, in_plan)
+        tag = f"SPPF({c1}->{c2},n{n},add={wide.add})"
+        check(f"{tag} cv2 in_plan has {n + 1} repeated segments",
+              len(getattr(wide.cv2, "_ofa_in_plan").groups) == n + 1,
+              f"got {getattr(wide.cv2, '_ofa_in_plan').groups}")
+        if wide.add:
+            check(f"{tag} residual ties out_plan to in_plan",
+                  out_plan.groups == in_plan.groups
+                  and out_plan.elastic == in_plan.elastic)
+
+        for w in WIDTHS:
+            twin = build_narrow_twin(wide, w)
+            x = torch.randn(2, in_plan.active(w), 16, 16)
+            set_width(wide, w)
+            with torch.no_grad():
+                got, want = wide(x), twin(x)
+            if got.shape != want.shape:
+                check(f"{tag} w={w} shape", False,
+                      f"{tuple(got.shape)} vs {tuple(want.shape)}")
+                continue
+            d = (got - want).abs().max().item()
+            check(f"{tag} w={w} equals narrow twin", d < ATOL, f"max|diff|={d:.3e}")
+
+
+def test_m56_whole_model() -> None:
+    """M5/M6: plan the whole yolo26s graph, then check the standing invariants.
+
+    An exact narrow twin is impossible for the FULL net (attention caches head
+    dims, so a channel-sliced twin would be invalid — oracle_util refuses).
+    Per-module exactness is already established above; here we check the two
+    whole-graph properties that matter:
+      1. bit-identity at w=1.0 (planning must be a no-op at full width)
+      2. a clean, finite forward at every width, with the head's fixed output
+    """
+    print("\n[M5/M6] whole-model plan walk (yolo26s)")
+    import copy as _copy
+
+    from ultralytics.nn.tasks import DetectionModel
+
+    torch.manual_seed(0)
+    model = DetectionModel("yolo26s.yaml", ch=3, nc=80, verbose=False).eval()
+    reference = _copy.deepcopy(model).eval()  # never planned
+
+    try:
+        plans = plan_model(model, verbose=True)
+    except Exception as e:  # noqa: BLE001
+        check("plan_model completes", False, f"{type(e).__name__}: {e}")
+        return
+    check("plan_model completes", True)
+
+    n_planned = sum(
+        1 for m in model.modules()
+        if isinstance(m, Conv) and hasattr(m, "_ofa_out_plan")
+    )
+    n_conv = sum(1 for m in model.modules() if isinstance(m, Conv))
+    print(f"        planned {n_planned}/{n_conv} Convs "
+          f"({n_conv - n_planned} left frozen at width 1.0)")
+
+    x = torch.randn(1, 3, 256, 256)
+
+    set_width(model, 1.0)
+    with torch.no_grad():
+        a = model(x)
+        b = reference(x)
+    a0 = a[0] if isinstance(a, (list, tuple)) else a
+    b0 = b[0] if isinstance(b, (list, tuple)) else b
+    d = (a0 - b0).abs().max().item()
+    check("w=1.0 is bit-identical to the unplanned model", d == 0.0,
+          f"max|diff|={d:.3e}")
+
+    for w in WIDTHS:
+        set_width(model, w)
+        try:
+            with torch.no_grad():
+                out = model(x)
+        except Exception as e:  # noqa: BLE001
+            check(f"whole-model forward at w={w}", False, f"{type(e).__name__}: {e}")
+            continue
+        o = out[0] if isinstance(out, (list, tuple)) else out
+        finite = bool(torch.isfinite(o).all())
+        params = count_active_params(model, w)
+        check(f"whole-model forward at w={w} finite", finite,
+              f"shape={tuple(o.shape)}")
+        print(f"        w={w:<6} out={tuple(o.shape)}  active params={params/1e6:.2f}M")
+
+
 def main() -> int:
     print("=" * 68)
     print("elastic == narrow oracle")
@@ -335,7 +470,10 @@ def main() -> int:
     test_invariant_fires()
     test_m1_plain_conv()
     test_m2_c3k2_bottleneck()
+    test_m3_c3k2_nested_c3k()
+    test_m4_sppf()
     test_legacy_slicing_fails_the_oracle()
+    test_m56_whole_model()
     print("\n" + "=" * 68)
     print(f"{_PASSES} passed, {len(_FAILURES)} failed")
     for f in _FAILURES:
