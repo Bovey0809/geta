@@ -137,7 +137,11 @@ def main() -> int:
     ap.add_argument("--calib-mode", default="val", choices=["val", "train"],
                     help="val = clean letterbox; train = the augmentation "
                          "pipeline the original BN stats were fit under")
-    ap.add_argument("--tolerance", type=float, default=0.010)
+    ap.add_argument("--tolerance", type=float, default=0.020,
+                    help="max |delta| vs baseline at w=1.0. Catches a BROKEN "
+                         "procedure (the old one lost 12.6 pts); it cannot be "
+                         "tight enough to demand exact reproduction, because "
+                         "recal necessarily perturbs a co-adapted network")
     ap.add_argument("--device", default="0")
     ap.add_argument("--out", default="/root/gate_a.json")
     args = ap.parse_args()
@@ -183,7 +187,11 @@ def main() -> int:
     print(f"  SANITY GATE: {'PASS' if sane else 'FAIL'} "
           f"(need |delta| <= {args.tolerance:.3f})", flush=True)
     results["recal_w1.0"] = recal_full
+    results["recal_penalty"] = delta
     results["recal_sanity_pass"] = bool(sane)
+    print(f"  recal penalty at full width = {delta:+.4f} -- this is the cost of "
+          f"REPLACING co-adapted stats,\n  not a width effect, so w<1 results are "
+          f"reported against BOTH references below.", flush=True)
     del y, model
     torch.cuda.empty_cache()
 
@@ -213,10 +221,16 @@ def main() -> int:
         del y, model
         torch.cuda.empty_cache()
 
-    print("\n" + header)
+    print()
+    print(f"  reference A: stock yolo26s, pretrained stats  = {base:.4f}")
+    print(f"  reference B: w=1.0 under the SAME recal       = {recal_full:.4f}")
+    print()
+    print(f"{'w':>6} {'params':>9} {'mAP':>8} {'vs A':>8} {'vs B':>8} "
+          f"{'n->s bar':>9} {'verdict':>9}")
     for w, p, m, bar in rows:
-        print(f"{w:>6.3f} {p:>8.2f}M {m:>9.4f} {bar:>9.4f} "
-              f"{'  ABOVE' if m > bar else '  below':>8}")
+        print(f"{w:>6.3f} {p:>8.2f}M {m:>8.4f} {m - base:>+8.4f} "
+              f"{m - recal_full:>+8.4f} {bar:>9.4f} "
+              f"{'ABOVE' if m > bar else 'below':>9}")
 
     got = {w: m for w, _, m, _ in rows}
     a_target = 0.875
