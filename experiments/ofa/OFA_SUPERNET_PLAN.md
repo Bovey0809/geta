@@ -305,6 +305,62 @@ per-batch variances discards `Var(E_batch)` and under-estimates.
   12.5% of channels are dropped. Still `0.0` ⇒ something structural remains; stop and
   reassess rather than pile on training.
 
+### GATE A RESULT — **FAIL**, but a soft, informative one *(2026-08-20)*
+
+Recal sanity: **PASS** (w=1.0 → 0.4593 vs 0.4715 baseline, −0.0122, within 0.020).
+
+| w | params | mAP | vs A (0.4715) | vs B (0.4593) | n→s bar |
+|---|---|---|---|---|---|
+| 1.000 | 10.01 M | 0.4593 | −0.0122 | — | 0.4777 |
+| 0.875 | 8.49 M | **0.0395** | −0.4320 | −0.4198 | 0.4607 |
+| 0.750 | 7.15 M | 0.0001 | −0.4714 | −0.4592 | 0.4458 |
+| 0.625 | 6.01 M | 0.0000 | −0.4715 | −0.4593 | 0.4330 |
+| 0.500 | 5.05 M | 0.0000 | −0.4715 | −0.4593 | 0.4223 |
+
+**Gate A: w=0.875 = 0.0395, needed > 0.20 → FAIL.**
+
+Two things are nonetheless established. First, the P1 fix is real and measurable:
+w=0.875 moved from the old **exactly 0.0** to **0.0395**, and the degradation is
+now smooth and monotone in width rather than uniformly zero. Second, the failure
+is **not** a remaining bug.
+
+#### Damage profile — the failure is distributed, not localised
+
+`damage_profile.py` at w=0.875, per-layer relative MSE against the *corresponding*
+channels of the full-width run:
+
+```
+L0  Conv   0.0322  (+0.032)   L8  C3k2  0.7081  (+0.068)
+L1  Conv   0.1167  (+0.085)   L9  SPPF  0.8067  (+0.099)
+L2  C3k2   0.3383  (+0.222)   L10 C2PSA 0.8947  (+0.088)
+L4  C3k2   0.3829  (+0.278)   L13 C3k2  0.8723  (+0.077)
+L6  C3k2   0.5582  (+0.308)   L19 C3k2  0.8030
+L7  Conv   0.6396  (+0.082)   L22 C3k2  0.9624
+```
+
+Verdict: **shape (b) — small everywhere, compounding.** The very first conv
+already injects 3.2 % error from dropping 4 of 32 channels; every elastic layer
+adds more, and by L10 the features are ~89 % relative MSE, i.e. essentially
+unrelated to the full-width activations. No single layer dominates, so there is
+no concentrated lead to chase — this is the arithmetic consequence of choosing
+channels **arbitrarily** and compounding it over 24 layers.
+
+#### What this implies
+
+Gate A's 0.20 bar assumed a converged detector would survive arbitrary 12.5 %
+channel removal with only BN recal. For *this* network that was optimistic:
+the GETA pruning study on the same architecture already found one-shot pruning
+collapses by ~10 % sparsity. Arbitrary first-k selection is simply not viable
+here, which makes **importance sorting (P3) load-bearing rather than a
+refinement** — it is precisely the lever that turns "an arbitrary 12.5 %" into
+"the least useful 12.5 %".
+
+**Honest risk to carry into P3:** that same pruning result — importance-ordered
+(HESSO) removal collapsing at ~10 % sparsity on this net *without* fine-tuning —
+means sorting alone may still not clear a useful bar. Sorting is nonetheless a
+prerequisite for P6 to have any chance, because progressive shrinking only works
+when the smallest sub-net starts non-broken and its gradients are therefore sane.
+
 ### P3 — Importance-based channel sorting → **GATE B** *(4–6 h local + 1 h GPU)*
 Per-**group** `argsort` by effective post-fusion scale `|γ| / sqrt(running_var + ε)`,
 propagated to every consumer's input columns.
