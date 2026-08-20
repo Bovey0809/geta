@@ -50,6 +50,8 @@ accumulate through a sliced forward, so per-width BN must be handled explicitly
 
 from __future__ import annotations
 
+import types
+from contextlib import contextmanager
 from dataclasses import dataclass
 
 import torch
@@ -63,6 +65,12 @@ __all__ = [
     "set_width",
     "get_width",
     "install_elastic_conv",
+    "recal_mode",
+    "recalibrate",
+    "clear_bn_stats",
+    "bn_stats_coverage",
+    "disable_fuse",
+    "count_active_params",
 ]
 
 
@@ -200,6 +208,20 @@ class ChannelPlan:
 _WIDTH_ATTR = "_ofa_width"
 _IN_PLAN = "_ofa_in_plan"
 _OUT_PLAN = "_ofa_out_plan"
+_STATS = "_ofa_bn_stats"  # dict[width_key] -> [mean, var, n_updates]
+
+# Recalibration state. While active, planned Convs normalise with BATCH
+# statistics and accumulate per-width running stats into their own store.
+_RECAL = {"active": False, "momentum": 0.02}
+
+
+def _wkey(w: float) -> float:
+    return round(float(w), 6)
+
+
+def _has_bn_stats(mod: nn.Module, w: float) -> bool:
+    store = getattr(mod, _STATS, None)
+    return store is not None and _wkey(w) in store
 
 
 def set_plans(conv: Conv, in_plan: ChannelPlan, out_plan: ChannelPlan) -> None:
@@ -246,19 +268,82 @@ def _sel(plan: ChannelPlan, w: float, device) -> torch.Tensor:
     return plan.select(w, device=device)
 
 
+def _elastic_bn(
+    owner: Conv, bn: nn.BatchNorm2d, y: torch.Tensor, out_sel: torch.Tensor, w: float
+) -> torch.Tensor:
+    """BatchNorm for a sliced activation, with PER-WIDTH running statistics.
+
+    Why per-width stats are mandatory rather than a refinement: a sub-network's
+    activation distribution is genuinely different from the full network's, so
+    reusing the full-width `running_mean`/`running_var` mis-normalises every
+    narrow forward. The previous implementation additionally *corrupted* the
+    shared buffer, because `bn.running_mean[:k]` is a view that
+    `F.batch_norm(training=True)` writes through. Group-structured selection
+    returns copies, so that corruption is gone — but it also means stats can no
+    longer accumulate implicitly. Hence an explicit store, keyed by width.
+    """
+    weight, bias = bn.weight[out_sel], bn.bias[out_sel]
+    key = _wkey(w)
+
+    if _RECAL["active"]:
+        with torch.no_grad():
+            bmean = y.mean(dim=(0, 2, 3))
+            bvar = y.var(dim=(0, 2, 3), unbiased=False)
+        store = getattr(owner, _STATS, None)
+        if store is None:
+            store = {}
+            setattr(owner, _STATS, store)
+        entry = store.get(key)
+        if entry is None:
+            store[key] = [bmean.clone(), bvar.clone(), 1]
+        else:
+            mom = _RECAL["momentum"]
+            entry[0].mul_(1.0 - mom).add_(bmean, alpha=mom)
+            entry[1].mul_(1.0 - mom).add_(bvar, alpha=mom)
+            entry[2] += 1
+        # normalise with batch stats, as BN train mode would
+        return F.batch_norm(y, None, None, weight, bias, training=True,
+                            momentum=0.0, eps=bn.eps)
+
+    store = getattr(owner, _STATS, None)
+    if store is not None and key in store:
+        rm, rv = store[key][0], store[key][1]
+    else:
+        rm = bn.running_mean[out_sel] if bn.running_mean is not None else None
+        rv = bn.running_var[out_sel] if bn.running_var is not None else None
+    return F.batch_norm(y, rm, rv, weight, bias, training=False,
+                        momentum=0.1, eps=bn.eps)
+
+
+def _use_stock_path(mod: Conv, out_plan, in_plan, w: float) -> bool:
+    """True when nothing needs slicing and no per-width stats apply.
+
+    Note the recal/stats conditions: at w=1.0 we normally short-circuit to the
+    stock op (that is what guarantees bit-identity), but during a
+    recalibration pass — and afterwards, once w=1.0 stats exist — we must go
+    through the sliced path so the recalibrated statistics are actually used.
+    Otherwise the "recal at w=1.0 must reproduce the baseline" sanity gate
+    would pass trivially without testing anything.
+    """
+    if _RECAL["active"] or _has_bn_stats(mod, w):
+        return False
+    if w >= 1.0:
+        return True
+    return not (in_plan.any_elastic or out_plan.any_elastic)
+
+
 def _elastic_forward(self: Conv, x: torch.Tensor) -> torch.Tensor:
     """Conv.forward honouring ChannelPlan-based width slicing."""
     out_plan: ChannelPlan | None = getattr(self, _OUT_PLAN, None)
     w = getattr(self, _WIDTH_ATTR, 1.0)
     conv: nn.Conv2d = self.conv
 
-    if out_plan is None or w >= 1.0:
-        # unplanned or full width -> stock path, bit-identical by construction
+    if out_plan is None:
         return self.act(self.bn(conv(x)))
 
     in_plan: ChannelPlan = getattr(self, _IN_PLAN)
-    if not (in_plan.any_elastic or out_plan.any_elastic):
-        # fully frozen on both sides -> nothing to slice
+    if _use_stock_path(self, out_plan, in_plan, w):
+        # bit-identical to the stock op by construction
         return self.act(self.bn(conv(x)))
     dev = conv.weight.device
     out_sel = _sel(out_plan, w, dev)
@@ -293,16 +378,7 @@ def _elastic_forward(self: Conv, x: torch.Tensor) -> torch.Tensor:
 
     bn = self.bn
     if isinstance(bn, nn.BatchNorm2d):
-        y = F.batch_norm(
-            y,
-            bn.running_mean[out_sel] if bn.running_mean is not None else None,
-            bn.running_var[out_sel] if bn.running_var is not None else None,
-            bn.weight[out_sel],
-            bn.bias[out_sel],
-            training=bn.training,
-            momentum=bn.momentum if bn.momentum is not None else 0.1,
-            eps=bn.eps,
-        )
+        y = _elastic_bn(self, bn, y, out_sel, w)
     else:
         y = bn(y)
     return self.act(y)
@@ -360,6 +436,87 @@ def install_elastic_conv() -> None:
     Conv.forward = _elastic_forward
     Conv.forward_fuse = _elastic_forward_fuse
     _INSTALLED = True
+
+
+@contextmanager
+def recal_mode(momentum: float = 0.02):
+    """Inside this block, planned Convs accumulate per-width BN statistics."""
+    prev = dict(_RECAL)
+    _RECAL["active"] = True
+    _RECAL["momentum"] = float(momentum)
+    try:
+        yield
+    finally:
+        _RECAL.update(prev)
+
+
+def clear_bn_stats(model: nn.Module, w: float | None = None) -> int:
+    """Drop stored per-width stats (all widths, or just one). Returns count."""
+    n = 0
+    for m in model.modules():
+        store = getattr(m, _STATS, None)
+        if not store:
+            continue
+        if w is None:
+            n += len(store)
+            store.clear()
+        elif _wkey(w) in store:
+            del store[_wkey(w)]
+            n += 1
+    return n
+
+
+def bn_stats_coverage(model: nn.Module, w: float) -> tuple[int, int]:
+    """(convs with stats for this width, convs that need them)."""
+    have = need = 0
+    for m in model.modules():
+        if not (isinstance(m, Conv) and hasattr(m, _OUT_PLAN)):
+            continue
+        if not isinstance(m.bn, nn.BatchNorm2d):
+            continue
+        need += 1
+        if _has_bn_stats(m, w):
+            have += 1
+    return have, need
+
+
+@torch.no_grad()
+def recalibrate(
+    model: nn.Module,
+    batches,
+    w: float,
+    momentum: float = 0.02,
+    device=None,
+) -> int:
+    """Refit BN statistics for width `w` by forwarding `batches` (no grads).
+
+    `batches` is any iterable of image tensors already normalised the way the
+    validator normalises them. Returns the number of batches consumed.
+    """
+    set_width(model, w)
+    clear_bn_stats(model, w)
+    model.eval()  # dropout etc. off; BN behaviour is driven by recal_mode
+    n = 0
+    with recal_mode(momentum):
+        for imgs in batches:
+            if device is not None:
+                imgs = imgs.to(device, non_blocking=True)
+            model(imgs)
+            n += 1
+    return n
+
+
+def disable_fuse(model: nn.Module) -> None:
+    """Make `model.fuse()` a no-op.
+
+    Ultralytics' validator fuses Conv+BN before evaluating. Fusion folds the
+    ORIGINAL full-width running stats into the conv weights and deletes `bn`,
+    which would silently discard every recalibrated per-width statistic and
+    leave us measuring the wrong thing. Cheaper and safer to skip fusion for
+    elastic evaluation than to try to fuse per width.
+    """
+    model.fuse = types.MethodType(lambda self, verbose=True: self, model)
+    model.is_fused = types.MethodType(lambda self, thresh=10: False, model)
 
 
 def count_active_params(model: nn.Module, w: float) -> int:
