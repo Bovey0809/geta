@@ -212,7 +212,7 @@ _STATS = "_ofa_bn_stats"  # dict[width_key] -> [mean, var, n_updates]
 
 # Recalibration state. While active, planned Convs normalise with BATCH
 # statistics and accumulate per-width running stats into their own store.
-_RECAL = {"active": False, "momentum": 0.02}
+_RECAL = {"active": False, "momentum": None}  # None => cumulative average
 
 
 def _wkey(w: float) -> float:
@@ -296,6 +296,17 @@ def _elastic_bn(
         entry = store.get(key)
         if entry is None:
             store[key] = [bmean.clone(), bvar.clone(), 1]
+        elif _RECAL["momentum"] is None:
+            # Cumulative average over all recal batches (the default).
+            # A one-shot recal sees a FIXED set of batches, so there is no
+            # reason to exponentially forget the earlier ones: an EMA with a
+            # small momentum over few batches is dominated by whichever
+            # batches came first. Measured cost of getting this wrong: recal
+            # at w=1.0 returned 0.4509 instead of the 0.4715 baseline.
+            entry[2] += 1
+            n = entry[2]
+            entry[0].add_((bmean - entry[0]) / n)
+            entry[1].add_((bvar - entry[1]) / n)
         else:
             mom = _RECAL["momentum"]
             entry[0].mul_(1.0 - mom).add_(bmean, alpha=mom)
@@ -439,11 +450,11 @@ def install_elastic_conv() -> None:
 
 
 @contextmanager
-def recal_mode(momentum: float = 0.02):
+def recal_mode(momentum: float | None = None):
     """Inside this block, planned Convs accumulate per-width BN statistics."""
     prev = dict(_RECAL)
     _RECAL["active"] = True
-    _RECAL["momentum"] = float(momentum)
+    _RECAL["momentum"] = None if momentum is None else float(momentum)
     try:
         yield
     finally:
@@ -485,7 +496,7 @@ def recalibrate(
     model: nn.Module,
     batches,
     w: float,
-    momentum: float = 0.02,
+    momentum: float | None = None,
     device=None,
 ) -> int:
     """Refit BN statistics for width `w` by forwarding `batches` (no grads).
