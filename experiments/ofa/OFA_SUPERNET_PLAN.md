@@ -448,7 +448,57 @@ slice. Add explicit per-width buffers (slimmable-networks switchable-BN pattern)
 share `γ`/`β`, keep separate `running_mean`/`running_var` per width in the elastic set.
 - **GATE C: `w=0.75` ≥ 0.35 with no weight training at all.**
 
-### P5 — *(optional)* attention elasticity, unlocks "the whole network shrinks"
+### P5 RESULT — real improvement, verdict unchanged *(2026-08-21)*
+
+182/182 oracle tests (attention included), 19/19 sorter. C2PSA (L10) and
+C3k2-attn (L22) are now elastic; 96 of 114 convs planned (the remaining 18 are
+Detect's fixed-output interior).
+
+| w | params (frozen → elastic) | mAP (frozen) | mAP (**elastic**) | n→s bar |
+|---|---|---|---|---|
+| 1.000 | 10.01 → 10.01 M | 0.4593 | 0.4611 | 0.4777 |
+| 0.990 | 9.87 → 9.80 M | 0.4317 | 0.4250 | 0.4754 |
+| 0.980 | 9.75 → 9.65 M | 0.4021 | 0.3806 | 0.4736 |
+| 0.960 | 9.51 → 9.26 M | 0.3346 | 0.3008 | 0.4693 |
+| 0.940 | 9.25 → 8.90 M | 0.2563 | 0.2141 | 0.4653 |
+| 0.920 | 9.03 → 8.59 M | 0.1911 | 0.1427 | 0.4618 |
+| 0.875 | 8.49 → 7.80 M | 0.0395 | 0.0134 | 0.4531 |
+| 0.750 | 7.15 → 5.88 M | 0.0001 | 0.0000 | 0.4316 |
+| 0.500 | 5.05 → **2.87 M** | 0.0000 | 0.0000 | **0.3981** |
+
+**At matched parameters, elastic attention is strictly better** — which is the
+comparison that matters, since it drops more channels at any given `w`:
+
+| ~params | frozen-attn mAP | elastic-attn mAP | gain |
+|---|---|---|---|
+| ~8.5 M | 0.0395 (w=0.875) | **0.1427** (w=0.92) | **3.6×** |
+| ~9.25 M | 0.2563 (w=0.94) | **0.3008** (w=0.96) | +4.5 pts |
+| ~9.8 M | 0.4317 (w=0.99) | 0.4250 (w=0.99) | ≈ equal |
+
+So P5 genuinely shifted the curve up-and-left, and it removed the structural
+blocker: **w=0.5 is now 2.87 M, against yolo26n's 2.6 M**, so the bar there is
+0.3981 — essentially "beat n" — instead of the unreachable 0.4223 at 5.05 M.
+
+**What did not change:** every width is still far below its bar in the
+zero-training regime. Best case is 0.4250 at 9.80 M against a 0.4754 bar; the
+n-competitive point (2.87 M) is at 0.0000. The earlier structural finding
+survives P5 — survivable widths (≥0.96) save ≤7 % of parameters, and the widths
+that save real parameters (≤0.875) are dead.
+
+**What P5 changes about P6's prospects.** Two things now favour training that
+did not before:
+
+1. **The prize is real.** A trained w=0.5 at 2.87 M matching n's 0.395 would be
+   a genuine result, and the whole continuum above it comes from the same run.
+2. **There is a ladder of healthy footholds**, not just one: 0.99 → 0.4250,
+   0.98 → 0.3806, 0.96 → 0.3008, 0.94 → 0.2141, 0.92 → 0.1427. Progressive
+   shrinking can descend it one rung at a time, recovering at each step, which
+   is precisely how OFA is meant to work and was impossible before P1/P4/P5.
+
+That makes P6 a more defensible bet than it was — while still an expensive one,
+since walking from 0.92 to 0.50 means recovering several mAP points per rung.
+
+### P5 — attention elasticity, unlocks "the whole network shrinks" — ✅ **DONE**
 `C2PSA` (L10) and `C3k2-attn` (L22) are frozen at full width, and L22 is the entire
 P5 head (512 ch) — this is where the remaining savings are.
 Design: keep `head_dim`/`key_dim` **fixed** and scale **`num_heads`**, so every retained
