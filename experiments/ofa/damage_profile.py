@@ -48,6 +48,7 @@ from channel_plan import (  # noqa: E402
     set_width,
 )
 from plan_builder import plan_model  # noqa: E402
+from sorter import sort_model  # noqa: E402
 
 from ultralytics import YOLO  # noqa: E402
 from ultralytics.nn.modules.head import Detect  # noqa: E402
@@ -85,6 +86,7 @@ def main() -> int:
     ap.add_argument("--batches", type=int, default=8)
     ap.add_argument("--batch", type=int, default=8)
     ap.add_argument("--calib-batches", type=int, default=100)
+    ap.add_argument("--sort", action="store_true")
     ap.add_argument("--device", default="0")
     ap.add_argument("--out", default="/root/damage_profile.json")
     args = ap.parse_args()
@@ -100,6 +102,9 @@ def main() -> int:
     y = YOLO(args.model)
     model = y.model.to(device)
     plans = plan_model(model)
+    if args.sort:
+        sort_model(model)
+        print("channel sorting APPLIED")
     disable_fuse(model)
     model.eval()
 
