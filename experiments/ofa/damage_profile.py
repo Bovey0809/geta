@@ -113,6 +113,14 @@ def main() -> int:
         i: p for i, p in enumerate(plans) if p is not None
     }
 
+    # Recalibrate the w=1.0 REFERENCE too. Otherwise the reference uses the
+    # pretrained running stats while the narrow run uses recalibrated ones, and
+    # every rel_mse silently mixes the width effect with the recal effect --
+    # enough on its own to make even L0 (whose retained channels are otherwise
+    # bit-identical to the full run) look damaged.
+    print("recalibrating the w=1.0 reference...", flush=True)
+    recalibrate(model, calib, 1.0, device=device)
+
     results = {}
     for w in args.widths:
         print(f"\n=== width {w} ===", flush=True)
