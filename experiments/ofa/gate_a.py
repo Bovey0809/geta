@@ -45,7 +45,7 @@ from channel_plan import (  # noqa: E402
     set_width,
 )
 from plan_builder import plan_model  # noqa: E402
-from sorter import sort_model  # noqa: E402
+from sorter import set_criterion, sort_model  # noqa: E402
 
 from ultralytics import YOLO  # noqa: E402
 
@@ -153,11 +153,14 @@ def main() -> int:
     ap.add_argument("--sort", action="store_true",
                     help="apply importance-based channel sorting (P3) so "
                          "first-k becomes top-k; this is Gate B")
+    ap.add_argument("--criterion", default="gamma",
+                    choices=["gamma", "gamma_over_sigma", "out_l1"])
     ap.add_argument("--device", default="0")
     ap.add_argument("--out", default="/root/gate_a.json")
     args = ap.parse_args()
 
     install_elastic_conv()
+    set_criterion(args.criterion)
     device = torch.device(f"cuda:{args.device}" if torch.cuda.is_available() else "cpu")
 
     print("building calibration batches from the TRAIN split "

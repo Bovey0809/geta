@@ -63,21 +63,73 @@ class SortError(RuntimeError):
 # --- importance -------------------------------------------------------------
 
 
-def importance(conv: Conv) -> torch.Tensor:
-    """Per-output-channel importance.
+CRITERION = "gamma"  # module-level default; see set_criterion()
 
-    Uses the effective post-fusion scale |gamma| / sqrt(running_var + eps),
-    which is what actually multiplies each channel once BN is folded into the
-    conv — a better ranking than |gamma| alone, because a large gamma paired
-    with a large running variance contributes no more than a small one paired
-    with a small variance.
+
+def set_criterion(name: str) -> None:
+    global CRITERION
+    if name not in _CRITERIA:
+        raise SortError(f"unknown criterion {name!r}; have {sorted(_CRITERIA)}")
+    CRITERION = name
+
+
+def _crit_gamma(conv: Conv) -> torch.Tensor:
+    """|gamma| -- the BN scale (Network Slimming, Liu et al. 2017).
+
+    THIS IS THE CORRECT MAGNITUDE PROXY. BatchNorm computes
+    y = gamma*(x - mu)/sqrt(var + eps) + beta, so the normalisation divides the
+    pre-BN standard deviation out and the post-BN activation of channel j has
+    std ~= |gamma_j|, independent of running_var.
+    """
+    bn = conv.bn
+    if isinstance(bn, nn.BatchNorm2d):
+        return bn.weight.detach().abs()
+    return conv.conv.weight.detach().abs().flatten(1).sum(1)
+
+
+def _crit_gamma_over_sigma(conv: Conv) -> torch.Tensor:
+    """|gamma| / sqrt(var + eps) -- the FUSED WEIGHT magnitude. Kept to
+    document a measured mistake, not because it is useful here.
+
+    This is the right proxy for how big the *folded conv weights* become, but
+    NOT for how big the channel's *output* is -- BN has already divided sigma
+    out. Using it ranks up channels whose pre-BN variance happened to be
+    small, which anti-correlates with importance whenever variance varies.
+    Measured cost at w=0.875: it made the first selection-sensitive layer 2.15x
+    WORSE than arbitrary first-k selection (rel_mse 0.1907 vs 0.0887), and cost
+    14x end-to-end mAP (0.0027 vs 0.0395).
     """
     bn = conv.bn
     if isinstance(bn, nn.BatchNorm2d):
         return (bn.weight.detach().abs()
                 / (bn.running_var.detach() + bn.eps).sqrt())
-    # no BN (already fused, or act-only): fall back to weight magnitude
     return conv.conv.weight.detach().abs().flatten(1).sum(1)
+
+
+def _crit_out_l1(conv: Conv) -> torch.Tensor:
+    """L1 norm of each output filter, scaled by |gamma| when BN is present.
+
+    Accounts for the filter that produces the channel as well as the BN gain,
+    so a channel with a large gamma but a tiny filter ranks below one with
+    both moderate.
+    """
+    w = conv.conv.weight.detach().abs().flatten(1).sum(1)
+    bn = conv.bn
+    if isinstance(bn, nn.BatchNorm2d):
+        return w * bn.weight.detach().abs()
+    return w
+
+
+_CRITERIA = {
+    "gamma": _crit_gamma,
+    "gamma_over_sigma": _crit_gamma_over_sigma,
+    "out_l1": _crit_out_l1,
+}
+
+
+def importance(conv: Conv) -> torch.Tensor:
+    """Per-output-channel importance under the active CRITERION."""
+    return _CRITERIA[CRITERION](conv)
 
 
 # --- permutation helpers ----------------------------------------------------

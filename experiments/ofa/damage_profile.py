@@ -48,7 +48,7 @@ from channel_plan import (  # noqa: E402
     set_width,
 )
 from plan_builder import plan_model  # noqa: E402
-from sorter import sort_model  # noqa: E402
+from sorter import set_criterion, sort_model  # noqa: E402
 
 from ultralytics import YOLO  # noqa: E402
 from ultralytics.nn.modules.head import Detect  # noqa: E402
@@ -87,11 +87,14 @@ def main() -> int:
     ap.add_argument("--batch", type=int, default=8)
     ap.add_argument("--calib-batches", type=int, default=100)
     ap.add_argument("--sort", action="store_true")
+    ap.add_argument("--criterion", default="gamma",
+                    choices=["gamma", "gamma_over_sigma", "out_l1"])
     ap.add_argument("--device", default="0")
     ap.add_argument("--out", default="/root/damage_profile.json")
     args = ap.parse_args()
 
     install_elastic_conv()
+    set_criterion(args.criterion)
     device = torch.device(f"cuda:{args.device}" if torch.cuda.is_available() else "cpu")
 
     from gate_a import CalibBatches
