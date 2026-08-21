@@ -45,6 +45,7 @@ from channel_plan import (  # noqa: E402
     set_width,
 )
 from plan_builder import plan_model  # noqa: E402
+from sorter import sort_model  # noqa: E402
 
 from ultralytics import YOLO  # noqa: E402
 
@@ -108,11 +109,18 @@ class CalibBatches:
             yield b["img"].float() / 255.0
 
 
-def fresh_planned_model(weights: str, device):
-    """Load yolo26s, plan it, and make it safe for elastic evaluation."""
+def fresh_planned_model(weights: str, device, sort: bool = False):
+    """Load yolo26s, plan it, optionally sort it, make it safe for eval.
+
+    Sorting must happen BEFORE recalibration: stored per-width statistics are
+    indexed by channel position, so permuting afterwards would silently
+    associate every channel with another channel's statistics.
+    """
     y = YOLO(weights)
     model = y.model.to(device)
     plan_model(model)
+    if sort:
+        sort_model(model)
     disable_fuse(model)
     return y, model
 
@@ -142,6 +150,9 @@ def main() -> int:
                          "procedure (the old one lost 12.6 pts); it cannot be "
                          "tight enough to demand exact reproduction, because "
                          "recal necessarily perturbs a co-adapted network")
+    ap.add_argument("--sort", action="store_true",
+                    help="apply importance-based channel sorting (P3) so "
+                         "first-k becomes top-k; this is Gate B")
     ap.add_argument("--device", default="0")
     ap.add_argument("--out", default="/root/gate_a.json")
     args = ap.parse_args()
@@ -173,7 +184,7 @@ def main() -> int:
     print("\n" + "=" * 66)
     print("1. RECAL SANITY GATE  (recal at w=1.0 must reproduce the baseline)")
     print("=" * 66, flush=True)
-    y, model = fresh_planned_model(args.model, device)
+    y, model = fresh_planned_model(args.model, device, sort=args.sort)
     n = recalibrate(model, calib, 1.0, momentum=args.momentum, device=device)
     have, need = bn_stats_coverage(model, 1.0)
     print(f"  recalibrated on {n} batches; stats present for {have}/{need} convs",
@@ -203,12 +214,13 @@ def main() -> int:
 
     # ---- 2. Gate A: mAP at each width, with recal, no sorting/training ----
     print("\n" + "=" * 66)
-    print("2. GATE A  (recal only; no channel sorting, no weight training)")
+    print(f"2. {'GATE B (recal + IMPORTANCE SORTING)' if args.sort else 'GATE A (recal only, no sorting)'}"
+          "  -- no weight training either way")
     print("=" * 66, flush=True)
     header = f"{'w':>6} {'params':>9} {'mAP50-95':>9} {'n->s bar':>9} {'vs bar':>8}"
     rows = []
     for w in args.widths:
-        y, model = fresh_planned_model(args.model, device)
+        y, model = fresh_planned_model(args.model, device, sort=args.sort)
         params = count_active_params(model, w) / 1e6
         recalibrate(model, calib, w, momentum=args.momentum, device=device)
         set_width(model, w)
@@ -237,6 +249,7 @@ def main() -> int:
     gate_a = got.get(a_target, 0.0) > 0.20
     print(f"\nGATE A: w={a_target} mAP = {got.get(a_target, float('nan')):.4f} "
           f"{'>' if gate_a else '<='} 0.20  -> {'PASS' if gate_a else 'FAIL'}")
+    results["sorted"] = bool(args.sort)
     results["gate_a_pass"] = bool(gate_a)
     Path(args.out).write_text(json.dumps(results, indent=2))
     print(f"\nwrote {args.out}")
