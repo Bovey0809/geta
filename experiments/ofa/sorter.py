@@ -246,8 +246,29 @@ def sort_c3k(blk: C3k, in_perm: torch.Tensor) -> torch.Tensor:
     return _sort_out(blk.cv3)
 
 
+def sort_attention_block(blk: nn.Module, in_perm: torch.Tensor) -> torch.Tensor:
+    """Attention blocks: consume the permuted input, keep internals at identity.
+
+    Sorting INSIDE attention would have to respect the per-head [q|k|v]
+    sub-structure of qkv, and Gate B measured that sorting yields no
+    end-to-end benefit anyway, so it buys nothing here. Permuting only the
+    first conv's input columns and leaving every internal tensor in its
+    original order is self-consistent: the interior sees identity ordering
+    throughout, and the block reports identity to its consumers.
+    """
+    first = next((m for m in blk.modules() if isinstance(m, Conv)), None)
+    if first is None:
+        raise SortError(f"{type(blk).__name__}: no conv to adapt")
+    _permute_in(first, in_perm)
+    out_c = (blk.cv2.conv.out_channels if isinstance(getattr(blk, "cv2", None), Conv)
+             else first.conv.out_channels)
+    return _identity(out_c, in_perm.device)
+
+
 def sort_c2f(blk: C2f, in_perm: torch.Tensor) -> torch.Tensor:
     """cv2(cat(chunk(cv1(x)) + [m(y) ...])) — (2+n) segments of c."""
+    if _has_attention(blk):
+        return sort_attention_block(blk, in_perm)
     c = blk.c
     _permute_in(blk.cv1, in_perm)
     p_cv1 = _sort_out(blk.cv1)
@@ -349,7 +370,7 @@ def sort_model(model: nn.Module, verbose: bool = False) -> list:
         elif isinstance(L, nn.Upsample):
             perms[i] = in_perms[0]
         elif isinstance(L, C2PSA) or _has_attention(L):
-            perms[i] = sort_adapter_chain(L, in_perms[0])
+            perms[i] = sort_attention_block(L, in_perms[0])
         elif isinstance(L, SPPF):
             perms[i] = sort_sppf(L, in_perms[0])
         elif isinstance(L, (C2f, C3k2)):

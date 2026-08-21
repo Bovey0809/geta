@@ -24,6 +24,7 @@ import torch.nn as nn
 from ultralytics.nn.modules.block import (
     Attention,
     Bottleneck,
+    PSABlock,
     C2f,
     C2PSA,
     C3k,
@@ -36,6 +37,10 @@ from ultralytics.nn.modules.head import Detect
 from channel_plan import ChannelPlan, set_plans
 
 __all__ = [
+    "plan_attention",
+    "plan_psablock",
+    "plan_c2psa",
+    "head_plan",
     "plan_conv",
     "plan_bottleneck",
     "plan_c2f",
@@ -114,9 +119,12 @@ def plan_c2f(blk: C2f, in_plan: ChannelPlan) -> ChannelPlan:
         raise PlanError(
             f"expected cv1 out == 2*c ({2 * c}), got {blk.cv1.conv.out_channels}"
         )
-    set_plans(blk.cv1, in_plan, ChannelPlan((c, c)))
-
-    branch = ChannelPlan((c,))
+    # If this block carries attention (yolo26s L22), every tensor inside it must
+    # be head-structured so the attention residual lines up at every width.
+    branch = head_plan(blk) or ChannelPlan((c,))
+    if branch.total != c:
+        raise PlanError(f"branch plan total {branch.total} != c {c}")
+    set_plans(blk.cv1, in_plan, ChannelPlan.cat([branch, branch]))
     segments = [branch, branch]  # y[0], y[1] after the chunk
 
     cur = branch
@@ -142,10 +150,17 @@ def plan_submodule(sub: nn.Module, in_plan: ChannelPlan) -> ChannelPlan:
     if isinstance(sub, Bottleneck):
         return plan_bottleneck(sub, in_plan)
     if isinstance(sub, nn.Sequential):
-        raise PlanError(
-            "Sequential(.m) implies an attention block (PSABlock) — M7/M8, "
-            "left frozen at width 1.0 by design"
-        )
+        # C3k2(attn=True) puts Sequential(Bottleneck, PSABlock) in .m
+        cur = in_plan
+        for inner in sub:
+            if isinstance(inner, Bottleneck):
+                cur = plan_bottleneck(inner, cur)
+            elif isinstance(inner, PSABlock):
+                cur = plan_psablock(inner, cur)
+            else:
+                raise PlanError(
+                    f"unhandled {type(inner).__name__} inside Sequential(.m)")
+        return cur
     raise PlanError(f"unhandled submodule type {type(sub).__name__}")
 
 
@@ -218,6 +233,73 @@ def plan_sppf(blk: SPPF, in_plan: ChannelPlan) -> ChannelPlan:
         out_plan = ChannelPlan((blk.cv2.conv.out_channels,))
     set_plans(blk.cv2, cv2_in, out_plan)
     return out_plan
+
+
+# --- M7/M8: attention (P5) --------------------------------------------------
+
+
+def head_plan(mod: nn.Module) -> ChannelPlan | None:
+    """Head-structured plan `(head_dim,) * num_heads` for an attention block.
+
+    Tensors flowing into attention must carry this instead of a single `(c,)`
+    group. A single group gives `round(c*w)` active channels, whereas v carries
+    `num_heads * round(head_dim*w)`; those differ at some widths (w=0.9 gives
+    230 vs 232) and the `x + attn(x)` residual would not line up.
+    Head-structuring makes them equal by construction at every width.
+    """
+    attn = next((m for m in mod.modules() if isinstance(m, Attention)), None)
+    if attn is None:
+        return None
+    return ChannelPlan((attn.head_dim,) * attn.num_heads)
+
+
+def plan_attention(attn: Attention, in_plan: ChannelPlan) -> ChannelPlan:
+    """qkv is head-major [q|k|v] per head; pe is depth-wise over v; proj ties
+    back to the block input for the residual."""
+    nh, kd, hd = attn.num_heads, attn.key_dim, attn.head_dim
+    if in_plan.groups != (hd,) * nh:
+        raise PlanError(
+            f"attention needs a head-structured input plan {(hd,) * nh}, got "
+            f"{in_plan.groups}"
+        )
+    qkv_plan = ChannelPlan((kd, kd, hd) * nh)
+    if attn.qkv.conv.out_channels != qkv_plan.total:
+        raise PlanError(f"qkv out {attn.qkv.conv.out_channels} != {qkv_plan.total}")
+    set_plans(attn.qkv, in_plan, qkv_plan)
+
+    v_plan = ChannelPlan((hd,) * nh)          # v's slice of qkv
+    set_plans(attn.pe, v_plan, v_plan)        # depth-wise over v
+    set_plans(attn.proj, v_plan, in_plan)     # residual tie
+    return in_plan
+
+
+def plan_psablock(blk: PSABlock, in_plan: ChannelPlan) -> ChannelPlan:
+    """`x = x + attn(x)` then `x = x + ffn(x)` -- both residuals tie to in_plan."""
+    plan_attention(blk.attn, in_plan)
+    ffn0, ffn1 = blk.ffn[0], blk.ffn[1]
+    hidden = ChannelPlan((ffn0.conv.out_channels,))
+    set_plans(ffn0, in_plan, hidden)
+    if ffn1.conv.out_channels != in_plan.total:
+        raise PlanError(
+            f"ffn out {ffn1.conv.out_channels} != block in {in_plan.total}")
+    set_plans(ffn1, hidden, in_plan)  # residual tie
+    return in_plan
+
+
+def plan_c2psa(blk: C2PSA, in_plan: ChannelPlan) -> ChannelPlan:
+    """cv1 -> chunk(2) -> [a, m(b)] -> cat -> cv2, with head-structured halves."""
+    half = head_plan(blk)
+    if half is None:
+        raise PlanError("C2PSA without an Attention descendant")
+    if half.total != blk.c:
+        raise PlanError(f"head plan total {half.total} != C2PSA.c {blk.c}")
+    set_plans(blk.cv1, in_plan, ChannelPlan.cat([half, half]))
+    for sub in blk.m:
+        plan_psablock(sub, half)
+    out_plan = ChannelPlan((blk.cv2.conv.out_channels,))
+    set_plans(blk.cv2, ChannelPlan.cat([half, half]), out_plan)
+    return out_plan
+
 
 
 # --- frozen-block boundaries (M5/M6 support) --------------------------------
@@ -334,8 +416,8 @@ def plan_model(model: nn.Module, verbose: bool = False) -> list:
             plans[i] = ChannelPlan.cat(in_plans)
         elif isinstance(L, nn.Upsample):
             plans[i] = in_plans[0]
-        elif isinstance(L, (C2PSA,)) or _has_attention(L):
-            plans[i] = plan_frozen_block(L, in_plans[0])
+        elif isinstance(L, C2PSA):
+            plans[i] = plan_c2psa(L, in_plans[0])
         elif isinstance(L, SPPF):
             plans[i] = plan_sppf(L, in_plans[0])
         elif isinstance(L, (C2f, C3k2)):

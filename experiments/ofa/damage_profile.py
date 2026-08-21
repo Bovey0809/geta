@@ -47,6 +47,7 @@ from channel_plan import (  # noqa: E402
     recalibrate,
     set_width,
 )
+from elastic_attn import install_elastic_attention  # noqa: E402
 from plan_builder import plan_model  # noqa: E402
 from sorter import set_criterion, sort_model  # noqa: E402
 
@@ -94,6 +95,7 @@ def main() -> int:
     args = ap.parse_args()
 
     install_elastic_conv()
+    install_elastic_attention()
     set_criterion(args.criterion)
     device = torch.device(f"cuda:{args.device}" if torch.cuda.is_available() else "cpu")
 

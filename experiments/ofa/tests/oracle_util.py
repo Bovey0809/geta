@@ -34,7 +34,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from channel_plan import _IN_PLAN, _OUT_PLAN, _WIDTH_ATTR, ChannelPlan  # noqa: E402
 
-__all__ = ["build_narrow_twin", "planned_convs", "assert_no_stale_channel_attr"]
+__all__ = ["build_narrow_twin", "planned_convs", "rescale_cached_head_dims"]
 
 
 def planned_convs(mod: nn.Module):
@@ -89,29 +89,32 @@ def _narrow_conv(src_conv: Conv, w: float) -> None:
 _CHANNEL_ATTRS = ("c", "c1", "c2", "c_", "cv", "num_heads", "key_dim", "head_dim")
 
 
-def assert_no_stale_channel_attr(mod: nn.Module, w: float) -> None:
-    """Fail loudly if a module caches a channel count its forward might use.
+def rescale_cached_head_dims(mod: nn.Module, w: float) -> None:
+    """Rescale the head geometry an Attention caches in __init__.
 
-    C2f/C3k2 cache `.c` but their forward uses `chunk(2,1)`, which is derived
-    from the tensor, so `.c` is inert there. Attention modules DO use their
-    cached dims — this is the tripwire for when we get to M7/M8.
+    C2f/C3k2 cache `.c`, but their forward derives the split from the tensor
+    via `chunk(2,1)`, so `.c` is inert. Attention is different: `num_heads`,
+    `key_dim`, `head_dim` and `scale` are all read directly by forward, so a
+    channel-sliced twin is wrong until they are rescaled. num_heads is held
+    FIXED (see elastic_attn.py) and only the per-head dims shrink; `scale` must
+    be recomputed from the new key_dim or the softmax is mis-tempered.
     """
     from ultralytics.nn.modules.block import Attention
 
+    from channel_plan import _round_group
+
     for m in mod.modules():
         if isinstance(m, Attention):
-            raise AssertionError(
-                "Attention module in the narrow twin: its cached num_heads / "
-                "key_dim / head_dim ARE used by forward, so a channel-sliced "
-                "twin is invalid until M7/M8 rescales them."
-            )
+            m.key_dim = _round_group(m.key_dim, w)
+            m.head_dim = _round_group(m.head_dim, w)
+            m.scale = m.key_dim ** -0.5
 
 
 def build_narrow_twin(wide: nn.Module, w: float) -> nn.Module:
     """Deep-copy `wide` and shrink every planned Conv to its width-`w` slice."""
-    assert_no_stale_channel_attr(wide, w)
     twin = copy.deepcopy(wide)
     for conv in planned_convs(twin):
         _narrow_conv(conv, w)
+    rescale_cached_head_dims(twin, w)
     twin.eval()
     return twin

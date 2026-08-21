@@ -26,6 +26,7 @@ _HERE = Path(__file__).resolve()
 sys.path.insert(0, str(_HERE.parent.parent))
 
 from channel_plan import _OUT_PLAN, install_elastic_conv  # noqa: E402
+from elastic_attn import install_elastic_attention  # noqa: E402
 from plan_builder import plan_model  # noqa: E402
 from sorter import importance  # noqa: E402
 
@@ -34,6 +35,7 @@ from ultralytics.nn.modules.conv import Conv  # noqa: E402
 from ultralytics.nn.tasks import DetectionModel  # noqa: E402
 
 install_elastic_conv()
+install_elastic_attention()
 
 
 def main() -> int:

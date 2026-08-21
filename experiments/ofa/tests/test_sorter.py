@@ -37,6 +37,7 @@ from channel_plan import (  # noqa: E402
     install_elastic_conv,
     set_width,
 )
+from elastic_attn import install_elastic_attention  # noqa: E402
 from plan_builder import (  # noqa: E402
     plan_c2f,
     plan_conv,
@@ -49,6 +50,7 @@ from ultralytics.nn.modules.block import SPPF, C3k2  # noqa: E402
 from ultralytics.nn.modules.conv import Conv  # noqa: E402
 
 install_elastic_conv()
+install_elastic_attention()
 
 ATOL = 1e-4
 _FAIL: list[str] = []

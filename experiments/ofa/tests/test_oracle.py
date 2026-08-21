@@ -40,6 +40,7 @@ from channel_plan import (  # noqa: E402
     set_plans,
     set_width,
 )
+from elastic_attn import install_elastic_attention  # noqa: E402
 from plan_builder import plan_c2f, plan_model, plan_sppf  # noqa: E402
 
 from ultralytics.nn.modules.block import SPPF, C3k2  # noqa: E402
@@ -49,6 +50,7 @@ sys.path.insert(0, str(_HERE.parent))  # experiments/ofa/tests
 from oracle_util import build_narrow_twin  # noqa: E402
 
 install_elastic_conv()
+install_elastic_attention()
 
 WIDTHS = (1.0, 0.875, 0.75, 0.625, 0.5)
 ATOL = 1e-5
@@ -462,6 +464,65 @@ def test_m56_whole_model() -> None:
         print(f"        w={w:<6} out={tuple(o.shape)}  active params={params/1e6:.2f}M")
 
 
+def test_m7_attention() -> None:
+    """P5: C2PSA and C3k2-attn must be exact too, now that they are elastic.
+
+    This is the module whose forward reads CACHED integers (num_heads,
+    key_dim, head_dim, scale), so the narrow twin only becomes valid once
+    oracle_util rescales them -- which is exactly what makes this test the
+    check on the P5 design rather than on the slicing alone.
+    """
+    print("\n[M7/M8] attention: C2PSA (L10) and C3k2-attn (L22)")
+    torch.manual_seed(0)
+    from ultralytics.nn.modules.block import C2PSA
+    from plan_builder import plan_c2psa
+
+    for c1 in (512, 256):
+        wide = C2PSA(c1, c1, 1).eval()
+        randomize_bn(wide)
+        in_plan = ChannelPlan((c1,))
+        out_plan = plan_c2psa(wide, in_plan)
+        attn = wide.m[0].attn
+        tag = f"C2PSA({c1})"
+        check(f"{tag} nh={attn.num_heads} hd={attn.head_dim} kd={attn.key_dim}"
+              " qkv plan is (kd,kd,hd)*nh",
+              getattr(attn.qkv, "_ofa_out_plan").groups
+              == (attn.key_dim, attn.key_dim, attn.head_dim) * attn.num_heads)
+        for w in WIDTHS:
+            twin = build_narrow_twin(wide, w)
+            x = torch.randn(2, in_plan.active(w), 16, 16)
+            set_width(wide, w)
+            with torch.no_grad():
+                got, want = wide(x), twin(x)
+            if got.shape != want.shape:
+                check(f"{tag} w={w} shape", False,
+                      f"{tuple(got.shape)} vs {tuple(want.shape)}")
+                continue
+            d = (got - want).abs().max().item()
+            check(f"{tag} w={w} equals narrow twin", d < ATOL, f"max|diff|={d:.3e}")
+
+    # the real L22: C3k2 with attn=True -> .m = Sequential(Bottleneck, PSABlock)
+    wide = C3k2(768, 512, 1, True, 0.5, True).eval()
+    randomize_bn(wide)
+    in_plan = ChannelPlan((768,))
+    plan_c2f(wide, in_plan)
+    check("L22 C3k2-attn planned (has Attention inside)",
+          any(type(m).__name__ == "Attention" for m in wide.modules()))
+    for w in WIDTHS:
+        twin = build_narrow_twin(wide, w)
+        x = torch.randn(2, in_plan.active(w), 16, 16)
+        set_width(wide, w)
+        with torch.no_grad():
+            got, want = wide(x), twin(x)
+        if got.shape != want.shape:
+            check(f"C3k2-attn(768->512) w={w} shape", False,
+                  f"{tuple(got.shape)} vs {tuple(want.shape)}")
+            continue
+        d = (got - want).abs().max().item()
+        check(f"C3k2-attn(768->512) w={w} equals narrow twin", d < ATOL,
+              f"max|diff|={d:.3e}")
+
+
 def main() -> int:
     print("=" * 68)
     print("elastic == narrow oracle")
@@ -472,6 +533,7 @@ def main() -> int:
     test_m2_c3k2_bottleneck()
     test_m3_c3k2_nested_c3k()
     test_m4_sppf()
+    test_m7_attention()
     test_legacy_slicing_fails_the_oracle()
     test_m56_whole_model()
     print("\n" + "=" * 68)
