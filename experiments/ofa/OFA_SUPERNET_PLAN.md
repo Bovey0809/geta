@@ -361,6 +361,77 @@ means sorting alone may still not clear a useful bar. Sorting is nonetheless a
 prerequisite for P6 to have any chance, because progressive shrinking only works
 when the smallest sub-net starts non-broken and its gradients are therefore sane.
 
+### GATE B RESULT — **FAIL**: correct sorting gives no end-to-end benefit
+
+| criterion | w=0.875 | w=0.75 | note |
+|---|---|---|---|
+| unsorted (Gate A) | **0.0395** | 0.0001 | arbitrary first-k |
+| `gamma` = \|γ\| | 0.0356 | 0.0002 | Network Slimming |
+| `out_l1` = ‖filter‖₁·\|γ\| | 0.0378 | 0.0003 | best early-layer profile |
+| `gamma_over_sigma` | 0.0027 | 0.0000 | **my bug** (below) |
+
+Sorting is **indistinguishable from arbitrary selection end-to-end**, despite
+cutting the first selection-sensitive layer's injected error by **2.4×**
+(L1 rel_mse 0.037–0.039 vs 0.089 unsorted). The damage profile reconciles those
+two facts: the early-layer advantage does not survive compounding — by L8 every
+variant sits at ~0.73 rel_mse and by L10 at ~0.89, so the Detect head receives
+~90 % corrupted features either way.
+
+#### Two bugs found by measurement, worth keeping
+
+1. **The damage profile had a confound.** It compared a narrow run using
+   *recalibrated* stats against a w=1.0 reference still using *pretrained*
+   stats, so every number mixed the width effect with the recal effect. The
+   tell: L0 reported 0.032 when it must be exactly 0 (its input is the unsliced
+   image and BN is per-channel, so no other channel can influence it).
+   After recalibrating the reference too, **L0 = 0.0000**.
+2. **The importance criterion was wrong.** BN computes
+   `y = γ(x−μ)/√(var+ε) + β`, so the normalisation divides σ **out** and
+   channel *j*'s post-BN activation has std ≈ `|γ_j|`, independent of
+   `running_var`. Ranking by `|γ|/√var` is the right proxy for the *fused
+   weight* magnitude but the wrong one for the channel's *output*: it promotes
+   channels whose pre-BN variance happened to be small, which anti-correlates
+   with importance. Cost of the mistake: L1 error **2.15× worse than arbitrary**,
+   and **14×** end-to-end mAP (0.0027 vs 0.0395).
+
+### THE DECIDING MEASUREMENT — fine width sweep near 1.0
+
+| w | params | mAP | vs recal ref (0.4593) | n→s bar |
+|---|---|---|---|---|
+| 1.00 | 10.01 M | 0.4593 | — | 0.4777 |
+| 0.99 | 9.87 M | **0.4317** | −0.028 | 0.4762 |
+| 0.98 | 9.75 M | **0.4021** | −0.057 | 0.4748 |
+| 0.96 | 9.51 M | 0.3346 | −0.125 | 0.4721 |
+| 0.94 | 9.25 M | 0.2563 | −0.203 | 0.4692 |
+| 0.92 | 9.03 M | 0.1911 | −0.268 | 0.4667 |
+| 0.875 | 8.49 M | 0.0395 | −0.420 | 0.4607 |
+| 0.75 | 7.15 M | 0.0001 | −0.459 | 0.4458 |
+
+**Good news:** progressive shrinking now has a genuine **foothold**. At
+w=0.98–0.99 the sub-net is very much alive (0.40–0.43), so a schedule
+`{1.0} → {1.0, 0.98} → {1.0, 0.98, 0.96} → …` would start from healthy sub-nets
+with sane gradients — precisely the condition the earlier training attempts
+lacked, since they jumped straight to 0.75/0.5 from a broken state.
+
+**The structural problem, and it is the decisive one:**
+
+> **The widths that survive save almost no parameters, and the widths that save
+> real parameters are dead.**
+>
+> * w ≥ 0.92 → alive (0.19–0.43) but only **1–10 % fewer params** (9.0–9.9 M vs 10.0 M)
+> * w ≤ 0.75 → **29 %+ fewer params** but 0.0001 mAP
+>
+> Sensitivity is ~2.8 mAP points per 1 % of channels removed. And the n→s bar
+> is hardest exactly where the model still works: at 9.5 M the bar *is* default
+> s (0.472), so near w=1.0 the requirement degenerates to "match s while being
+> smaller than s".
+
+So the achievable region is in the wrong place. For width-elastic OFA to yield
+a useful Pareto point, training would have to lift w≈0.75 (7.15 M) from 0.0001
+to beyond 0.4458 — a ~45-point recovery. For calibration, the pruning study's
+50-epoch full-COCO fine-tune recovered a 50 %-sparsity model to 80 % of dense.
+Recovering 45 points from ~zero is a different order of ask.
+
 ### P3 — Importance-based channel sorting → **GATE B** *(4–6 h local + 1 h GPU)*
 Per-**group** `argsort` by effective post-fusion scale `|γ| / sqrt(running_var + ε)`,
 propagated to every consumer's input columns.
