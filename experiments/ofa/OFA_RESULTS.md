@@ -43,14 +43,26 @@ is ESSENTIAL computation, not residual refinement. KD can't make a lower-capacit
 higher-capacity one (at lambda=10 KD dominated the loss; d=1 still didn't move). d=1 forward is
 correct (finite, right shape) -- the ceiling is fundamental, not a bug. See ../CONCLUSION.md.
 
-> **CAVEAT ADDED 2026-08-20 — "fundamental, not a bug" is no longer safe to assert.**
-> The sibling width-elastic study made exactly this claim and it turned out to be two
-> implementation bugs (see OFA_SUPERNET_PLAN.md). Two specific reasons to re-test d=1:
-> (1) both dropped bottlenecks are `add=True` **residual** blocks, and dropping a residual
-> block should degrade *gracefully* -- `y = x + f(x)` becoming `y = x` giving EXACTLY 0.0
-> mAP across 14 blocks is the same "suspiciously total" signature the width bugs had;
-> (2) d=1 was evaluated with **full-depth BN running stats** and no recalibration, and the
-> width study proved that mismatched BN statistics alone are enough to destroy a subnet.
-> The ~100% feature MSE is consistent with *either* a real capacity ceiling *or* an
-> un-recalibrated distribution shift -- it does not discriminate between them.
-> One cheap re-test (correct slicing + per-width BN recal) would settle it.
+> **RETRACTED 2026-08-23 — MEASURED, not just suspected.** The `0.0` above was
+> reproduced exactly (yolo26l, 14 C3k blocks, `0.0000`, neck rel-MSE
+> 0.643/1.005/1.090 vs the 0.58/0.99/1.12 reported here) and then corrected by
+> one controlled change: recalibrating BN for the depth being evaluated.
+>
+> |  | d=2 | d=1 |
+> |---|---|---|
+> | no recal (the protocol used above) | 0.5375 | **0.0000** |
+> | with per-depth recal | 0.5303 | **0.1473** |
+>
+> yolo26s reproduces the same pattern (0.0004 -> 0.1462). The d=2 control sits
+> on the baseline, so the harness is neutral and BN is the only variable.
+>
+> So "the elastic 2nd bottleneck is ESSENTIAL computation, not residual
+> refinement" and "the ceiling is fundamental, not a bug" are both **withdrawn**.
+> The feature-MSE argument is withdrawn too: that MSE reproduces while the
+> network still scores 0.147, so it never discriminated between a capacity
+> ceiling and an un-normalised distribution shift. The sandwich and feature-KD
+> rows are void as well -- same eval protocol, plus the BN-corruption bug that
+> affected all elastic training at the time.
+>
+> Depth-elastic remains unpromising rather than disproven: 0.147 from 0.530 for
+> ~-13% FLOPs, with training untested. Re-test: `depth_retest.py`.

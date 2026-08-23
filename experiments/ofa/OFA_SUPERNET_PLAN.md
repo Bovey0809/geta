@@ -564,6 +564,53 @@ degrades (+0.044 at a 0.38 start, +0.008 at a 0.02 start). Training does not
 close this; it moves the curve up by a few points while the requirement is
 tens of points away.
 
+### DEPTH-ELASTIC RE-TEST — the 2026-07-01 "0.0 mAP" was a BN artefact
+
+Same d=1 sub-network (drop the 2nd inner residual bottleneck of every C3k),
+evaluated four ways — on yolo26s *and* on **yolo26l, the model the original
+claim was actually made about**:
+
+| config | yolo26s (5 C3k) | **yolo26l (14 C3k)** | |
+|---|---|---|---|
+| stock, unplanned, fused | 0.4715 | **0.5375** | original reported 0.5377 |
+| d=2, no recal | 0.4716 | 0.5375 | control — the harness is neutral |
+| d=2, with recal | 0.4611 | 0.5303 | recal penalty only |
+| **d=1, no recal** | **0.0004** | **0.0000** | **exactly reproduces the original** |
+| **d=1, with recal** | **0.1462** | **0.1473** | **the correction** |
+
+The yolo26l column is an exact reproduction of the original experiment — same
+baseline (0.5375 vs the reported 0.5377), same 14 C3k blocks, same `0.0000` —
+followed by one controlled change. Both models land on ~0.147, which is itself
+reassuring: the corrected result is a property of the mechanism, not of a scale.
+
+**Verdict: the original conclusion was wrong.** "The elastic second bottleneck
+is *essential* computation, not residual refinement… the ceiling is fundamental,
+not a bug" does not hold. It was a batch-norm statistics artefact: evaluating a
+depth-1 sub-network with depth-2 running statistics. The d=2 control lands
+exactly on the baseline (0.4716 vs 0.4715), so the harness itself is neutral —
+the only thing that changed between 0.0004 and 0.1462 is whether BN was
+recalibrated for the sub-network being measured.
+
+**The mechanism argument was also invalid.** The original offered ~100 %
+relative neck-feature MSE as proof of a capacity ceiling. Re-measured on
+yolo26l: **P3 0.643, P4 1.005, P5 1.090** — essentially identical to the
+original's 0.58 / 0.99 / 1.12, so it is the same phenomenon, reproduced. But
+that large MSE coexists with a network scoring 0.147 once normalisation is
+fixed. **High feature MSE never discriminated between a capacity ceiling and an
+un-recalibrated distribution shift** — exactly the inferential error that also
+produced the width-elastic retraction. (yolo26s: 0.371 / 0.791 / 0.888.)
+
+Consequences, stated conservatively:
+
+* Paradigm 2's negative verdict is **retracted as unsupported**. Its *training*
+  results (10-ep sandwich, 5-ep feature-KD, both reported as 0.0) are equally
+  invalid — they were measured under the same no-recal protocol AND suffered
+  the BN-corruption bug during training.
+* Whether depth-elastic is *useful* is now genuinely **open but unpromising**:
+  0.146 from 0.461 buys roughly −13 % FLOPs, and by analogy with the measured
+  width recovery (+0.044 per rung, decaying) training would likely lift it only
+  modestly. Untested.
+
 ### P6 — Progressive-shrinking training → **GATE D** — **not run; probe answered it**
 Only meaningful once subnets *start* healthy — that's what makes gradients sane and is
 why the earlier training could never have worked.

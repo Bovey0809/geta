@@ -65,7 +65,28 @@ Earlier phases (see `geta_yolo26/FINDINGS.md`, `RESULTS_no_retrain.md`, `RESULTS
 one-shot pruning collapses by ~10 % sparsity; BN-recal recovers some for free; fine-tune
 recovery plateaus ~85-91 %. All consistent with **little structural redundancy**.
 
-## Paradigm 2 — depth-elastic OFA (dead end, same root cause)
+## Paradigm 2 — depth-elastic OFA (**RETRACTED — the 0.0 was a BN artefact**)
+> **Withdrawn 2026-08-23.** The `0.0 mAP` below was reproduced exactly
+> (yolo26l, 14 C3k blocks, `0.0000`) and then corrected by a single controlled
+> change — recalibrating BN for the depth actually being evaluated:
+>
+> | | d=2 | d=1 |
+> |---|---|---|
+> | no recal (original protocol) | 0.5375 | **0.0000** |
+> | with per-depth recal | 0.5303 | **0.1473** |
+>
+> The d=2 control lands on the baseline (0.5375 vs 0.5375), so the harness is
+> neutral; the only variable is BN. The claim below that "the elastic second
+> bottleneck is *essential* computation, not residual refinement" and that "the
+> ceiling is fundamental, not a bug" is therefore **unsupported** — as is the
+> ~100 % feature-MSE argument, since that MSE reproduces (0.643/1.005/1.090)
+> while the network nonetheless scores 0.147. High feature MSE never
+> distinguished a capacity ceiling from an un-normalised distribution shift.
+> The 10-ep sandwich and 5-ep feature-KD results are void for the same reason,
+> plus the BN-corruption bug that affected all elastic training then.
+> Whether depth-elastic is *useful* is open but unpromising: 0.147 from 0.530
+> buys ~−13 % FLOPs. Detail: `ofa/OFA_SUPERNET_PLAN.md`, `ofa/depth_retest.py`.
+
 Make yolo26l depth-elastic (each C3k runs 2→1 inner residual bottlenecks; `elastic_yolo26.py`),
 sandwich-train so both the full (d=2) and shrunk (d=1) sub-nets are usable with no retraining.
 
