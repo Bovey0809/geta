@@ -30,8 +30,6 @@ from ultralytics import YOLO  # noqa: E402
 
 def gflops(model, imgsz=640) -> float:
     from thop import profile
-    x = torch.zeros(1, 3, imgsz, imgsz, next(model.parameters()).device.index
-                    if next(model.parameters()).is_cuda else None)
     x = torch.zeros(1, 3, imgsz, imgsz).to(next(model.parameters()).device)
     with torch.no_grad():
         f, _ = profile(model, inputs=(x,), verbose=False)
