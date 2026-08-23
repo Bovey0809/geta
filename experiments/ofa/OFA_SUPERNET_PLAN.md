@@ -507,7 +507,64 @@ selects the first `round(num_heads·w)` **whole groups** — it drops straight i
 `ChannelPlan` with no special-casing. `proj.out_plan ≡ block.in_plan` (PSABlock residual).
 **Deferred until Gates A–B pass.**
 
-### P6 — Progressive-shrinking training → **GATE D** *(10–25 h GPU, ~¥100–250)*
+### SINGLE-RUNG PROBE — the answer on P6 *(2026-08-23)*
+
+Sandwich-trained `{1.0, 0.98}`, 6 epochs @ 15 % of COCO, lr 2e-4, kd 2.0
+(~23 min). Both arms evaluated before and after under the identical recal
+protocol; the checkpoint was md5-verified to differ from its input.
+
+| | w=1.0 | w=0.98 | gap |
+|---|---|---|---|
+| before | 0.4611 | 0.3806 | 0.0805 |
+| after | **0.4424** | **0.4250** | 0.0173 |
+
+**"78.4 % of the gap closed" overstates it.** Decomposing the 0.063 reduction:
+student **+0.0444**, teacher **−0.0187**. So 30 % of the closure is the max arm
+coming *down* to meet the small arm. Training the max arm with real gradient
+does now work (l_max 32.3 vs l_small 39.0 — comparable, not swamped), but
+elasticity still costs the full-width model: 0.4611 → 0.4424, and stock
+yolo26s is 0.4715.
+
+#### Transfer decays over ~4 width points
+
+Evaluating the *same* trained checkpoint across all widths:
+
+| w | untrained | after 1 rung @ 0.98 | Δ |
+|---|---|---|---|
+| 0.98 | 0.3806 | 0.4250 | **+0.0444** |
+| 0.96 | 0.3008 | 0.3434 | **+0.0426** |
+| 0.94 | 0.2141 | 0.2451 | +0.0310 |
+| 0.92 | 0.1427 | 0.1627 | +0.0200 |
+| 0.875 | 0.0134 | 0.0217 | +0.0083 |
+| 0.75 | 0.0000 | 0.0000 | **0** |
+| 0.50 | 0.0000 | 0.0000 | **0** |
+
+The ladder is **real** — one rung lifts its neighbours, nearly fully at 0.96 —
+but the spillover dies within ~4 width points, and the deep-shrink regime
+(w ≤ 0.75) gains *exactly nothing*. So the descent cannot skip: it needs ~12
+rungs of ~4 points to reach w=0.5, each one longer than the last as more widths
+join the sandwich. That is the 10–20 h the plan budgeted.
+
+#### Why that budget is not worth spending
+
+Compare the measured recovery against what each width actually needs:
+
+| w | params | now | n→s bar | shortfall | measured recovery/rung |
+|---|---|---|---|---|---|
+| 0.98 | 9.65 M | 0.4250 | 0.4736 | **0.049** | +0.044 |
+| 0.96 | 9.26 M | 0.3434 | 0.4693 | 0.126 | +0.043 |
+| 0.92 | 8.59 M | 0.1627 | 0.4618 | 0.299 | +0.020 |
+| 0.875 | 7.80 M | 0.0217 | 0.4531 | 0.431 | +0.008 |
+| 0.50 | 2.87 M | 0.0000 | 0.3981 | 0.398 | 0 |
+
+The only width within reach of one rung's recovery is **w=0.98 — which saves
+0.36 M parameters (3.6 %)**. Everywhere the saving is meaningful, the shortfall
+is 5–50× the per-rung recovery, and recovery *shrinks* as the starting point
+degrades (+0.044 at a 0.38 start, +0.008 at a 0.02 start). Training does not
+close this; it moves the curve up by a few points while the requirement is
+tens of points away.
+
+### P6 — Progressive-shrinking training → **GATE D** — **not run; probe answered it**
 Only meaningful once subnets *start* healthy — that's what makes gradients sane and is
 why the earlier training could never have worked.
 - Staged widths, never introduce a width whose current mAP is near zero:

@@ -6,13 +6,30 @@ via GETA structured pruning and, later, Once-for-All (OFA) elastic sub-networks.
 redundant capacity to remove, and post-hoc KD of a right-sized student doesn't beat its
 own baseline.** You are consistently better off picking the right-sized default model.
 
-> **⚠ RETRACTION (2026-08-20) — width-elastic OFA is NOT a settled dead end.**
-> Paradigm 3 below previously claimed width-elastic OFA hit "the same wall". That was
-> wrong: its `0.0 mAP` is now traced to **two confirmed implementation bugs** (internal
-> `chunk`/`cat` boundary violation under first-k slicing; shared BN running-stat
-> corruption across widths) — not to a capacity limit. The question is **reopened**.
-> See `ofa/OFA_SUPERNET_PLAN.md` for the evidence and the corrected plan.
-> The depth-elastic `0.0` (Paradigm 2) is consequently **also suspect**.
+> **RESOLVED (2026-08-23) — width-elastic OFA rebuilt correctly, and it still
+> does not produce a Pareto win.** The 2026-08-20 retraction stands on its facts:
+> the original `0.0 mAP` *was* two implementation bugs (internal `chunk`/`cat`
+> boundary violation under first-k slicing; shared BN running-stat corruption),
+> not a capacity limit. So the whole thing was rebuilt — `ChannelPlan`
+> group-structured slicing, per-width BN, importance sorting, elastic attention —
+> with **201 correctness tests** including an exact elastic-vs-narrow oracle per
+> module type. The rebuilt version works, and the answer is now *measured* rather
+> than inferred from a broken implementation:
+>
+> * a verified-correct sub-net at w=0.875 scores **0.0395**, not 0.0;
+> * importance sorting cuts first-layer error 2.4× and gives **no end-to-end gain**;
+> * elastic attention removes the parameter floor (w=0.5: 5.05 M → **2.87 M**, vs
+>   yolo26n's 2.6 M) and is strictly better at matched params (3.6× at ~8.5 M);
+> * one rung of sandwich training recovers **+0.044** at the trained width, with
+>   transfer decaying to zero within ~4 width points — while the widths that save
+>   real parameters need **0.30–0.43**.
+>
+> The measured obstacle is structural, not a tuning failure: **the widths that
+> survive save almost no parameters (w ≥ 0.96 → ≤ 7 %), and the widths that save
+> real parameters are dead (w ≤ 0.875).** Full detail: `ofa/OFA_SUPERNET_PLAN.md`.
+>
+> The depth-elastic `0.0` (Paradigm 2) remains **untested-suspect** — same class of
+> bug was found in its sibling, and it was evaluated with full-depth BN stats.
 > **Paradigm 1 (pruning) still stands** — it had a real 50-epoch full-COCO fine-tune.
 
 Hardware: single **RTX PRO 6000 Blackwell 96 GB** (final runs); earlier work on RTX 3080 Ti 12 GB.
