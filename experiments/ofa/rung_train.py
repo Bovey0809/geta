@@ -55,13 +55,14 @@ from channel_plan import (  # noqa: E402
     recalibrate,
     set_width,
 )
+from depth_retest import install_elastic_depth, set_depth  # noqa: E402
 from elastic_attn import install_elastic_attention  # noqa: E402
 from plan_builder import plan_model  # noqa: E402
 
 from ultralytics import YOLO  # noqa: E402
 
 
-def patch_sandwich(trainer, widths, kd_lambda, state):
+def patch_sandwich(trainer, configs, kd_lambda, state, apply_cfg):
     """Plan the trainer's model and install the sandwich loss."""
     m = trainer.model
     plan_model(m)
@@ -82,13 +83,13 @@ def patch_sandwich(trainer, widths, kd_lambda, state):
 
     def sloss(batch, preds=None):
         # --- max sub-net: real loss, and cache KD targets ---
-        set_width(m, widths[0])
+        apply_cfg(m, configs[0])
         l_max, items = orig_loss(batch) if preds is None else orig_loss(batch, preds)
         tfeat = [f.detach() for f in cap["f"]]
 
         total = l_max
-        for w in widths[1:]:
-            set_width(m, w)
+        for cfg in configs[1:]:
+            apply_cfg(m, cfg)
             l_s, _ = orig_loss(batch) if preds is None else orig_loss(batch, preds)
             kd = 0
             for s, t in zip(cap["f"], tfeat):
@@ -96,7 +97,7 @@ def patch_sandwich(trainer, widths, kd_lambda, state):
                 kd = kd + F.mse_loss(s, t[:, :k])
             total = total + l_s + kd_lambda * kd
 
-        set_width(m, widths[0])
+        apply_cfg(m, configs[0])
         ctr["n"] += 1
         if ctr["n"] <= 2 or ctr["n"] % 200 == 0:
             print(f"[rung {ctr['n']}] l_max={l_max.sum().item():.3f} "
@@ -105,27 +106,37 @@ def patch_sandwich(trainer, widths, kd_lambda, state):
         return total, items
 
     m.loss = sloss
-    print(f"[rung] sandwich installed: widths={widths} kd={kd_lambda}", flush=True)
+    print(f"[rung] sandwich installed: configs={configs} kd={kd_lambda}", flush=True)
 
 
-def evaluate_widths(weights, data, widths, calib, batch, device_arg, device):
-    """Recalibrate and evaluate each width on a freshly loaded checkpoint."""
+def evaluate_configs(weights, data, configs, calib, batch, device_arg, device,
+                     apply_cfg, is_depth, label):
+    """Recalibrate and evaluate each config on a freshly loaded checkpoint.
+
+    The config is applied BEFORE recalibration, so the stored statistics
+    describe the sub-network actually measured. Getting that order wrong
+    silently stores the other config's stats -- which is precisely the mistake
+    that produced the retracted depth-elastic 0.0.
+    """
     out = {}
-    for w in widths:
+    for cfg in configs:
         y = YOLO(weights)
         m = y.model.to(device)
         plan_model(m)
         disable_fuse(m)
-        recalibrate(m, calib, w, device=device)
-        have, need = bn_stats_coverage(m, w)
-        set_width(m, w)
+        apply_cfg(m, cfg)
+        recal_w = 1.0 if is_depth else cfg
+        recalibrate(m, calib, recal_w, device=device)
+        have, need = bn_stats_coverage(m, recal_w)
+        apply_cfg(m, cfg)          # recalibrate() re-sets width; re-assert depth
+        set_width(m, recal_w)
         res = y.val(data=data, imgsz=640, batch=batch, plots=False,
                     device=device_arg, verbose=False)
-        out[w] = {"map5095": float(res.box.map),
-                  "params_M": count_active_params(m, w) / 1e6,
-                  "bn_stats": f"{have}/{need}"}
-        print(f"  w={w:<6} params={out[w]['params_M']:5.2f}M  "
-              f"mAP={out[w]['map5095']:.4f}", flush=True)
+        out[cfg] = {"map5095": float(res.box.map),
+                    "params_M": count_active_params(m, recal_w) / 1e6,
+                    "bn_stats": f"{have}/{need}"}
+        print(f"  {label}={cfg:<6} params={out[cfg]['params_M']:5.2f}M  "
+              f"mAP={out[cfg]['map5095']:.4f}", flush=True)
         del y, m
         torch.cuda.empty_cache()
     return out
@@ -136,6 +147,9 @@ def main() -> int:
     ap.add_argument("--model", default="/root/yolo26s.pt")
     ap.add_argument("--data", default=str(_HERE / "coco.yaml"))
     ap.add_argument("--widths", type=float, nargs="+", default=[1.0, 0.98])
+    ap.add_argument("--depths", type=int, nargs="+", default=None,
+                    help="sandwich over C3k inner-bottleneck DEPTH instead "
+                         "of width, e.g. --depths 2 1")
     ap.add_argument("--epochs", type=int, default=6)
     ap.add_argument("--fraction", type=float, default=0.15)
     ap.add_argument("--batch", type=int, default=32)
@@ -149,8 +163,21 @@ def main() -> int:
 
     install_elastic_conv()
     install_elastic_attention()
+    install_elastic_depth()
     device = torch.device(f"cuda:{args.device}" if torch.cuda.is_available() else "cpu")
-    assert args.widths[0] == max(args.widths), "widths[0] must be the max sub-net"
+
+    is_depth = args.depths is not None
+    if is_depth:
+        configs = args.depths
+        label = "d"
+        def apply_cfg(m, c):
+            set_depth(m, int(c))
+    else:
+        configs = args.widths
+        label = "w"
+        def apply_cfg(m, c):
+            set_width(m, float(c))
+    assert configs[0] == max(configs), "configs[0] must be the max sub-net"
 
     from gate_a import CalibBatches
     calib = CalibBatches(args.data, 640, args.batch, args.calib_batches)
@@ -158,17 +185,17 @@ def main() -> int:
     print("=" * 66)
     print("BEFORE training")
     print("=" * 66, flush=True)
-    before = evaluate_widths(args.model, args.data, args.widths, calib,
-                             args.batch, args.device, device)
+    before = evaluate_configs(args.model, args.data, configs, calib, args.batch,
+                              args.device, device, apply_cfg, is_depth, label)
 
     print("\n" + "=" * 66)
-    print(f"TRAINING sandwich {args.widths}  ({args.epochs} ep @ "
+    print(f"TRAINING sandwich {label}={configs}  ({args.epochs} ep @ "
           f"fraction={args.fraction})")
     print("=" * 66, flush=True)
     state = {}
     y = YOLO(args.model)
     y.add_callback("on_train_start",
-                   lambda tr: patch_sandwich(tr, args.widths, args.kd, state))
+                   lambda tr: patch_sandwich(tr, configs, args.kd, state, apply_cfg))
     y.add_callback("on_train_epoch_end",
                    lambda tr: tr.ema.ema.load_state_dict(tr.model.state_dict())
                    if getattr(tr, "ema", None) is not None else None)
@@ -190,23 +217,25 @@ def main() -> int:
     print("\n" + "=" * 66)
     print("AFTER training")
     print("=" * 66, flush=True)
-    after = evaluate_widths(str(ckpt), args.data, args.widths, calib,
-                            args.batch, args.device, device)
+    after = evaluate_configs(str(ckpt), args.data, configs, calib, args.batch,
+                             args.device, device, apply_cfg, is_depth, label)
 
-    small = args.widths[-1]
-    gap_before = before[args.widths[0]]["map5095"] - before[small]["map5095"]
-    gap_after = after[args.widths[0]]["map5095"] - after[small]["map5095"]
+    small, big = configs[-1], configs[0]
+    gap_before = before[big]["map5095"] - before[small]["map5095"]
+    gap_after = after[big]["map5095"] - after[small]["map5095"]
     recovered = (gap_before - gap_after) / gap_before if gap_before > 0 else 0.0
     print("\n" + "=" * 66)
-    print(f"RUNG RECOVERY at w={small}")
+    print(f"RUNG RECOVERY at {label}={small}")
     print("=" * 66)
-    print(f"  before: max={before[args.widths[0]]['map5095']:.4f} "
+    print(f"  before: max={before[big]['map5095']:.4f} "
           f"small={before[small]['map5095']:.4f}  gap={gap_before:.4f}")
-    print(f"  after:  max={after[args.widths[0]]['map5095']:.4f} "
+    print(f"  after:  max={after[big]['map5095']:.4f} "
           f"small={after[small]['map5095']:.4f}  gap={gap_after:.4f}")
+    print(f"  small sub-net gain: "
+          f"{after[small]['map5095'] - before[small]['map5095']:+.4f}")
     print(f"  gap closed: {recovered * 100:.1f}%")
     print(f"  max sub-net drift: "
-          f"{after[args.widths[0]]['map5095'] - before[args.widths[0]]['map5095']:+.4f}")
+          f"{after[big]['map5095'] - before[big]['map5095']:+.4f}")
 
     Path(args.out).write_text(json.dumps(
         {"before": {str(k): v for k, v in before.items()},
