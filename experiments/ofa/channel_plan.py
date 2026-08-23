@@ -321,6 +321,17 @@ def _elastic_bn(
         return F.batch_norm(y, None, None, weight, bias, training=True,
                             momentum=0.0, eps=bn.eps)
 
+    if bn.training:
+        # TRAINING: normalise with BATCH statistics, exactly as BN normally
+        # would, and write nothing back. A sub-network's activation
+        # distribution differs from the full network's, so normalising a narrow
+        # forward with full-width running stats would train the weights against
+        # the wrong normalisation. Nothing accumulates (the gather returns a
+        # copy), which is why an explicit recalibration pass is required before
+        # evaluating any width.
+        return F.batch_norm(y, None, None, weight, bias, training=True,
+                            momentum=0.0, eps=bn.eps)
+
     store = getattr(owner, _STATS, None)
     if store is not None and key in store:
         acc_mean, acc_sq, _ = store[key]
