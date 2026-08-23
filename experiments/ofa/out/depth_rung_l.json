@@ -1,0 +1,50 @@
+{
+  "before": {
+    "2": {
+      "map5095": 0.5303110685232475,
+      "params_M": 26.299704,
+      "bn_stats": "160/160"
+    },
+    "1": {
+      "map5095": 0.14730237227410153,
+      "params_M": 26.299704,
+      "bn_stats": "132/160"
+    }
+  },
+  "after": {
+    "2": {
+      "map5095": 0.509587988322725,
+      "params_M": 26.299704,
+      "bn_stats": "160/160"
+    },
+    "1": {
+      "map5095": 0.4209038769536245,
+      "params_M": 26.299704,
+      "bn_stats": "132/160"
+    }
+  },
+  "gap_before": 0.38300869624914596,
+  "gap_after": 0.08868411136910048,
+  "fraction_recovered": 0.7684540527732254,
+  "args": {
+    "model": "/root/yolo26l.pt",
+    "data": "/root/geta/experiments/ofa/coco.yaml",
+    "widths": [
+      1.0,
+      0.98
+    ],
+    "depths": [
+      2,
+      1
+    ],
+    "epochs": 6,
+    "fraction": 0.15,
+    "batch": 16,
+    "lr": 0.0002,
+    "kd": 2.0,
+    "calib_batches": 200,
+    "name": "depth_rung_l",
+    "device": "0",
+    "out": "/root/depth_rung_l.json"
+  }
+}

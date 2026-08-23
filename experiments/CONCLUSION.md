@@ -84,8 +84,25 @@ recovery plateaus ~85-91 %. All consistent with **little structural redundancy**
 > distinguished a capacity ceiling from an un-normalised distribution shift.
 > The 10-ep sandwich and 5-ep feature-KD results are void for the same reason,
 > plus the BN-corruption bug that affected all elastic training then.
-> Whether depth-elastic is *useful* is open but unpromising: 0.147 from 0.530
-> buys ~−13 % FLOPs. Detail: `ofa/OFA_SUPERNET_PLAN.md`, `ofa/depth_retest.py`.
+> **Training then measured too** (same recipe as the width probe, 6 ep @ 15 %
+> COCO): d=1 recovers to **0.4209 on l** (+0.274) and **0.3823 on s** (+0.236) —
+> ~80 % of the gap, and **5–6× the width axis's +0.044 per rung**. So the depth
+> axis *is* trainable; the original's "KD cannot fix this" was also wrong.
+>
+> It is nonetheless **Pareto-dominated, for a mundane reason**: halving the C3k
+> inner bottlenecks saves only **5.2 % (s) / 12.7 % (l)** of MACs. Trained
+> l d=1 (0.4209 @ 40.96) loses to plain **yolo26s** (0.472 @ 11.42) — better
+> accuracy at a quarter of the compute; trained s d=1 (0.3823 @ 10.82) loses to
+> **yolo26n** (0.395 @ 3.05).
+>
+> So the practical conclusion survives but the explanation is entirely
+> different: not "the removed computation is essential", but **"the elastic
+> dimension is too small a share of compute to pay for what it costs"**. That
+> points somewhere specific — make elastic a dimension that carries real
+> compute. Untested candidate with a live prior: C3k2-level depth (dropping
+> whole C3k blocks, where yolo26l's `n=2` gives headroom), given ~80 %
+> per-rung recovery on this axis.
+> Detail: `ofa/OFA_SUPERNET_PLAN.md`, `ofa/depth_retest.py`, `ofa/rung_train.py`.
 
 Make yolo26l depth-elastic (each C3k runs 2→1 inner residual bottlenecks; `elastic_yolo26.py`),
 sandwich-train so both the full (d=2) and shrunk (d=1) sub-nets are usable with no retraining.

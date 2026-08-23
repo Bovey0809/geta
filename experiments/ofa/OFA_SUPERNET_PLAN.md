@@ -600,16 +600,60 @@ fixed. **High feature MSE never discriminated between a capacity ceiling and an
 un-recalibrated distribution shift** — exactly the inferential error that also
 produced the width-elastic retraction. (yolo26s: 0.371 / 0.791 / 0.888.)
 
-Consequences, stated conservatively:
+### DEPTH-ELASTIC TRAINING — recovers 5–6× better than width, still dominated
 
-* Paradigm 2's negative verdict is **retracted as unsupported**. Its *training*
-  results (10-ep sandwich, 5-ep feature-KD, both reported as 0.0) are equally
-  invalid — they were measured under the same no-recal protocol AND suffered
-  the BN-corruption bug during training.
-* Whether depth-elastic is *useful* is now genuinely **open but unpromising**:
-  0.146 from 0.461 buys roughly −13 % FLOPs, and by analogy with the measured
-  width recovery (+0.044 per rung, decaying) training would likely lift it only
-  modestly. Untested.
+Same recipe as the width rung probe (6 ep @ 15 % COCO, lr 2e-4, kd 2.0), so the
+numbers are directly comparable:
+
+| model | d=2 before → after | d=1 before → after | student gain | teacher drift | gap closed |
+|---|---|---|---|---|---|
+| yolo26s | 0.4611 → 0.4404 | 0.1462 → **0.3823** | **+0.2361** | −0.0207 | 81.6 % |
+| yolo26l | 0.5303 → 0.5096 | 0.1473 → **0.4209** | **+0.2736** | −0.0207 | 76.8 % |
+
+**The depth axis is genuinely trainable, unlike width.** One 6-epoch run on 15 %
+of COCO recovers **+0.24 to +0.27**, against **+0.044** for the best width rung —
+5–6× more, and the teacher drift is the same −0.021 in both cases. My prediction
+that depth would behave like width ("would likely lift it only modestly") was
+wrong, and wrong by a large margin.
+
+**But the compute saving is far too small to matter.** Measured with thop
+(MACs; ×2 gives ultralytics' GFLOPs, and 46.90 reproduces the original's 46.9):
+
+| model | d=2 | d=1 | saving |
+|---|---|---|---|
+| yolo26s | 11.42 | 10.82 | **−5.2 %** |
+| yolo26l | 46.90 | 40.96 | **−12.7 %** |
+
+Halving the C3k inner bottlenecks removes only 5–13 % of the work, because those
+bottlenecks are a small share of total compute. Placing the trained points on
+the compute/accuracy plane against the default family:
+
+| point | MACs | mAP | dominated by |
+|---|---|---|---|
+| yolo26n | 3.05 | 0.395 | — |
+| **yolo26s d=1 (trained)** | 10.82 | 0.3823 | **yolo26n** — better mAP at 3.5× less compute |
+| yolo26s d=2 | 11.42 | 0.472 | — |
+| yolo26m | 37.70 | 0.518 | — |
+| **yolo26l d=1 (trained)** | 40.96 | 0.4209 | **yolo26s** — better mAP at 4× less compute |
+| yolo26l d=2 | 46.90 | 0.5375 | — |
+
+Both trained d=1 points are **heavily Pareto-dominated**, and not marginally:
+yolo26l d=1 is beaten by plain yolo26s on both axes at a quarter of the compute.
+
+#### Corrected verdict on Paradigm 2
+
+The original's *reasoning* was wrong on every count — the 0.0 was a BN artefact,
+the feature-MSE mechanism argument was invalid, and training recovers ~80 % of
+the gap rather than nothing. Its *practical* conclusion happens to survive, but
+for a completely different and much more mundane reason: **the elastic dimension
+is too small a fraction of compute to pay for the accuracy it costs.**
+
+That is a far more useful finding than "the ceiling is fundamental", because it
+says exactly what would have to change: **make elastic a dimension that actually
+carries compute.** The obvious untested candidate is C3k2-level depth — dropping
+whole C3k blocks rather than their inner bottlenecks — where yolo26l's `n=2`
+repeats give real headroom. Given ~80 % per-rung recovery on this axis, that is
+the one direction in this study with a live prior.
 
 ### P6 — Progressive-shrinking training → **GATE D** — **not run; probe answered it**
 Only meaningful once subnets *start* healthy — that's what makes gradients sane and is
