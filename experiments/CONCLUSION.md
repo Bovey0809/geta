@@ -213,6 +213,39 @@ terms hurts. But the full 40-epoch CWD run reached only **0.5031 — below defau
 baseline (8-ep screening ≈ 40-ep run). The honest remaining test is KD during **full
 from-scratch training** (~500 ep, ~100 h+) — untested here.
 
+## Paradigm 5 — intermediate model size, trained (the non-compression route)
+Every paradigm above *removes* capacity from a trained checkpoint. This tests the
+route that built the family in the first place: train a size that doesn't exist.
+**width 0.375** (`ofa/yolo26-w375.yaml`) sits at **5.655 M**, in the empty gap
+between n (2.572 M) and s (10.010 M).
+
+Init: the public `yolo26s-objv1-150.pt` (Objects365, 150 ep) sliced to 0.375 via
+`ChannelPlan` with importance-sorted channels — 78 convs transferred, 0
+mismatched, since `make_divisible(c·0.375,8)` is exactly 0.75× its 0.50
+counterpart. Recipe: the **official** yolo26s COCO stage read verbatim from
+`yolo26s.pt`'s own `train_args` (70 ep, batch 128, MuSGD). 7.0 h on one PRO 6000.
+
+| | params | mAP50-95 |
+|---|---|---|
+| yolo26n | 2.572 M | **0.395** |
+| **w375** | 5.655 M | **0.3863** |
+| *n→s bar* | 5.655 M | *0.427* |
+| yolo26s | 10.010 M | 0.472 |
+
+**Pareto-dominated by yolo26n** — lower mAP at 2.2× the parameters, and 0.041
+short of the interpolation bar. Still improving at +0.001/ep at epoch 70, and
+the expected `close_mosaic` bump at epoch 61 **never appeared**, so no generous
+extrapolation reaches 0.427.
+
+**What this does and does not show.** It establishes that *slicing s down to
+0.375 and fine-tuning 70 epochs* fails. It does **not** establish that
+intermediate widths are bad architectures. Landing *below n* is the tell: with
+2.2× n's capacity and a genuine 150-epoch Objects365 pretrain, a 0.375 model
+should beat n comfortably. Scoring under it implicates the **initialisation**,
+matching this study's own finding that sliced-init sub-nets start near zero and
+recover only partially. The clean test — from-scratch arms at matched budget,
+~60–90 h GPU — was not run. Data: `ofa/out/w375_coco.json`.
+
 ## Unified conclusion (revised 2026-08-20)
 **What holds:** structured pruning deletes capacity YOLO26 actually uses and a
 50-epoch full-COCO fine-tune recovers only ~80 % of dense-x (0.450 at default-m's

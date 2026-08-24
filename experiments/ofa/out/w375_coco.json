@@ -1,0 +1,62 @@
+{
+  "experiment": "yolo26 width-0.375 intermediate size, official COCO stage",
+  "question": "can an intermediate model size, trained properly, beat the n/s/m/l/x scaling curve?",
+  "model": {
+    "cfg": "experiments/ofa/yolo26-w375.yaml (loaded as yolo26s-w375.yaml, scale 's' = width 0.375)",
+    "params_M": 5.655,
+    "width": 0.375,
+    "depth": 0.50,
+    "max_channels": 1024
+  },
+  "init": {
+    "source": "yolo26s-objv1-150.pt (public, Objects365 150ep, nc=365)",
+    "method": "ChannelPlan slice at w=0.75 with importance-sorted channels",
+    "convs_transferred": 78,
+    "convs_skipped": 0,
+    "convs_mismatched": 0,
+    "head": "reinitialised for nc=80 (365 -> 80), as the official pipeline does",
+    "note": "no Objects365 checkpoint exists at width 0.375, so that stage was inherited by slicing rather than trained"
+  },
+  "recipe": {
+    "source": "verbatim from yolo26s.pt train_args (the official COCO stage for size s)",
+    "epochs": 70,
+    "batch": 128,
+    "optimizer": "MuSGD",
+    "lr0": 0.00038,
+    "lrf": 0.88219,
+    "nbs": 64,
+    "amp": true,
+    "close_mosaic": 10,
+    "hardware": "1x RTX PRO 6000 (96GB), 44GB peak",
+    "wall_hours": 7.005
+  },
+  "result": {
+    "map5095": 0.3863,
+    "map50": 0.5474,
+    "best_epoch": 70,
+    "still_improving_at_end": true,
+    "final_slope_per_epoch": 0.001,
+    "close_mosaic_bump": "NONE observed at epoch 61 (expected +0.01..0.03)"
+  },
+  "trajectory_map5095": {
+    "43": 0.35636,
+    "60": 0.37630,
+    "61": 0.37682,
+    "67": 0.38402,
+    "70": 0.38688
+  },
+  "comparison": {
+    "yolo26n": {"params_M": 2.572, "map5095": 0.395},
+    "yolo26s": {"params_M": 10.010, "map5095": 0.472},
+    "n_to_s_interpolation_bar_at_5.655M": 0.427,
+    "shortfall_vs_bar": -0.041,
+    "vs_n": -0.009,
+    "verdict": "Pareto-DOMINATED by yolo26n: lower mAP at 2.2x the parameters"
+  },
+  "interpretation": {
+    "established": "slicing yolo26s down to width 0.375 and fine-tuning 70 epochs does NOT produce a competitive model",
+    "NOT_established": "that intermediate widths are worthless as architectures",
+    "reasoning": "landing BELOW n is the tell. A width-0.375 architecture with a true 150-epoch Objects365 pretrain should comfortably beat n given 2.2x the capacity. Scoring under n points at the INITIALISATION as the binding constraint, not the architecture -- consistent with this study's earlier finding that sliced-init sub-nets start near zero and recover only partially.",
+    "clean_test_not_run": "true from-scratch arms at matched budget (~60-90h GPU)"
+  }
+}
