@@ -30,9 +30,9 @@ mandatory (skipping it is what produced two retracted conclusions).
 
 Usage:
   # gold baselines, one model per width, trained independently
-  python experiments/ofa/voc_ofa_validate.py baselines --widths 1.0 0.75 0.5 --epochs 100
-  # one supernet over the same widths
-  python experiments/ofa/voc_ofa_validate.py supernet  --widths 1.0 0.75 0.5 --epochs 100
+  python experiments/ofa/voc_ofa_validate.py baselines --widths 0.50 0.375 0.25 --epochs 100
+  # one supernet over the same widths (0.50 == yolo26s, 0.25 == yolo26n)
+  python experiments/ofa/voc_ofa_validate.py supernet  --widths 0.50 0.375 0.25 --epochs 100
   # compare
   python experiments/ofa/voc_ofa_validate.py report
 """
@@ -79,6 +79,14 @@ RECIPE = dict(
 
 def width_cfg(width: float) -> str:
     """Write a yolo26 yaml whose 's' scale carries the requested width.
+
+    NOTE: `width` is the ABSOLUTE yolo26 width multiplier, not a fraction of s.
+    With max_channels 1024 (what n and s use):
+        0.50  == yolo26s  (10.0M)
+        0.375 == the intermediate size (5.66M)
+        0.25  == yolo26n  (2.57M)
+    Passing 1.0 here builds a ~39.8M model, not s -- an easy and expensive
+    mistake, caught by a 1-epoch smoke.
 
     ultralytics only parses scale letters [nslmx], and rewrites
     yolo26<letter>-<suffix>.yaml -> yolo26-<suffix>.yaml to find the shared
@@ -274,7 +282,8 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("cmd", choices=["baselines", "supernet", "report"])
     ap.add_argument("--data", default="/root/autodl-tmp/VOC/VOC.yaml")
-    ap.add_argument("--widths", type=float, nargs="+", default=[1.0, 0.75, 0.5])
+    ap.add_argument("--widths", type=float, nargs="+", default=[0.50, 0.375, 0.25],
+                    help="ABSOLUTE yolo26 width multipliers: 0.50=s, 0.25=n")
     ap.add_argument("--epochs", type=int, default=100)
     ap.add_argument("--batch", type=int, default=64)
     ap.add_argument("--kd", type=float, default=2.0)
