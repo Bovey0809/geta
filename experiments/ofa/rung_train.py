@@ -55,6 +55,7 @@ from channel_plan import (  # noqa: E402
     recalibrate,
     set_width,
 )
+from block_depth import install_block_depth, set_block_depth  # noqa: E402
 from depth_retest import install_elastic_depth, set_depth  # noqa: E402
 from elastic_attn import install_elastic_attention  # noqa: E402
 from plan_builder import plan_model  # noqa: E402
@@ -150,6 +151,10 @@ def main() -> int:
     ap.add_argument("--depths", type=int, nargs="+", default=None,
                     help="sandwich over C3k inner-bottleneck DEPTH instead "
                          "of width, e.g. --depths 2 1")
+    ap.add_argument("--block-depths", type=int, nargs="+", default=None,
+                    help="sandwich over BLOCK depth -- how many C3k blocks of "
+                         "each C3k2's .m to keep, e.g. --block-depths 2 1. "
+                         "Saves ~30%% MACs on yolo26l vs ~13%% for inner depth.")
     ap.add_argument("--epochs", type=int, default=6)
     ap.add_argument("--fraction", type=float, default=0.15)
     ap.add_argument("--batch", type=int, default=32)
@@ -164,10 +169,16 @@ def main() -> int:
     install_elastic_conv()
     install_elastic_attention()
     install_elastic_depth()
+    install_block_depth()
     device = torch.device(f"cuda:{args.device}" if torch.cuda.is_available() else "cpu")
 
-    is_depth = args.depths is not None
-    if is_depth:
+    is_depth = args.depths is not None or args.block_depths is not None
+    if args.block_depths is not None:
+        configs = args.block_depths
+        label = "bd"
+        def apply_cfg(m, c):
+            set_block_depth(m, int(c))
+    elif args.depths is not None:
         configs = args.depths
         label = "d"
         def apply_cfg(m, c):

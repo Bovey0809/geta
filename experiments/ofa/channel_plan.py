@@ -136,32 +136,43 @@ class ChannelPlan:
             acc += g
         return tuple(out)
 
-    def active_groups(self, w: float) -> tuple[int, ...]:
-        """Per-group active sizes at width w (frozen groups keep full size)."""
+    def active_groups(self, w: float, n_groups: int | None = None) -> tuple[int, ...]:
+        """Per-group active sizes at width w (frozen groups keep full size).
+
+        `n_groups` keeps only the first n groups, dropping the TRAILING ones.
+        That is what block-level depth elasticity needs: dropping an item from
+        a C2f/C3k2 `.m` list removes one concatenated segment from cv2's input,
+        which shrinks the group COUNT rather than the size of each group.
+        """
+        groups = self.groups if n_groups is None else self.groups[:n_groups]
+        elastic = self.elastic if n_groups is None else self.elastic[:n_groups]
         if w >= 1.0:
-            return self.groups
+            return tuple(groups)
         return tuple(
             g if not el else _round_group(g, w)
-            for g, el in zip(self.groups, self.elastic)
+            for g, el in zip(groups, elastic)
         )
 
-    def active(self, w: float) -> int:
+    def active(self, w: float, n_groups: int | None = None) -> int:
         """Total active channel count at width w."""
-        return sum(self.active_groups(w))
+        return sum(self.active_groups(w, n_groups))
 
     # -- selection -----------------------------------------------------------
 
-    def select(self, w: float, device=None) -> torch.Tensor:
+    def select(self, w: float, device=None,
+               n_groups: int | None = None) -> torch.Tensor:
         """Indices into the FULL tensor that survive at width w.
 
         Contiguous when there is a single group; otherwise a gather of the
-        per-group prefixes. Returned as a LongTensor so it can index weights.
+        per-group prefixes. `n_groups` additionally drops trailing groups
+        (block-level depth). Returned as a LongTensor so it can index weights.
         """
-        if w >= 1.0:
+        if w >= 1.0 and n_groups is None:
             return torch.arange(self.total, device=device)
+        offs = self.offsets() if n_groups is None else self.offsets()[:n_groups]
         parts = [
             torch.arange(off, off + k, device=device)
-            for off, k in zip(self.offsets(), self.active_groups(w))
+            for off, k in zip(offs, self.active_groups(w, n_groups))
         ]
         return torch.cat(parts) if len(parts) > 1 else parts[0]
 
@@ -209,6 +220,7 @@ _WIDTH_ATTR = "_ofa_width"
 _IN_PLAN = "_ofa_in_plan"
 _OUT_PLAN = "_ofa_out_plan"
 _STATS = "_ofa_bn_stats"  # dict[width_key] -> [mean, var, n_updates]
+_IN_GROUPS = "_ofa_in_groups"  # block-level depth: keep first N in-groups
 
 # Recalibration state. While active, planned Convs normalise with BATCH
 # statistics and accumulate per-width running stats into their own store.
@@ -356,6 +368,8 @@ def _use_stock_path(mod: Conv, out_plan, in_plan, w: float) -> bool:
     """
     if _RECAL["active"] or _has_bn_stats(mod, w):
         return False
+    if getattr(mod, _IN_GROUPS, None) is not None:
+        return False  # trailing input groups dropped -> must slice
     if w >= 1.0:
         return True
     return not (in_plan.any_elastic or out_plan.any_elastic)
@@ -378,7 +392,7 @@ def _elastic_forward(self: Conv, x: torch.Tensor) -> torch.Tensor:
     out_sel = _sel(out_plan, w, dev)
 
     if conv.groups == 1:
-        in_sel = _sel(in_plan, w, dev)
+        in_sel = in_plan.select(w, dev, getattr(self, _IN_GROUPS, None))
         # The invariant that makes structural bugs loud instead of silent.
         assert x.shape[1] == in_sel.numel(), (
             f"{type(self).__name__}: incoming channels {x.shape[1]} != in_plan "
@@ -435,7 +449,7 @@ def _elastic_forward_fuse(self: Conv, x: torch.Tensor) -> torch.Tensor:
     out_sel = _sel(out_plan, w, dev)
 
     if conv.groups == 1:
-        in_sel = _sel(in_plan, w, dev)
+        in_sel = in_plan.select(w, dev, getattr(self, _IN_GROUPS, None))
         assert x.shape[1] == in_sel.numel(), (
             f"{type(self).__name__} (fused): incoming {x.shape[1]} != in_plan "
             f"selection {in_sel.numel()} at w={w}"
@@ -565,7 +579,8 @@ def count_active_params(model: nn.Module, w: float) -> int:
         out_plan: ChannelPlan = getattr(m, _OUT_PLAN)
         c = m.conv
         if c.groups == 1:
-            out_k, in_k = out_plan.active(w), in_plan.active(w)
+            out_k = out_plan.active(w)
+            in_k = in_plan.active(w, getattr(m, _IN_GROUPS, None))
         else:
             out_k = in_k = in_plan.active(w)
         kh, kw = c.kernel_size
