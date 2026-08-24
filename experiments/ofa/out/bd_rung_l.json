@@ -1,0 +1,51 @@
+{
+  "before": {
+    "2": {
+      "map5095": 0.5303110685232475,
+      "params_M": 26.299704,
+      "bn_stats": "160/160"
+    },
+    "1": {
+      "map5095": 0.10576682211732422,
+      "params_M": 25.660728,
+      "bn_stats": "111/160"
+    }
+  },
+  "after": {
+    "2": {
+      "map5095": 0.5112040800147041,
+      "params_M": 26.299704,
+      "bn_stats": "160/160"
+    },
+    "1": {
+      "map5095": 0.39150356040118095,
+      "params_M": 25.660728,
+      "bn_stats": "111/160"
+    }
+  },
+  "gap_before": 0.42454424640592325,
+  "gap_after": 0.11970051961352313,
+  "fraction_recovered": 0.7180493655799711,
+  "args": {
+    "model": "/root/yolo26l.pt",
+    "data": "/root/geta/experiments/ofa/coco.yaml",
+    "widths": [
+      1.0,
+      0.98
+    ],
+    "depths": null,
+    "block_depths": [
+      2,
+      1
+    ],
+    "epochs": 6,
+    "fraction": 0.15,
+    "batch": 16,
+    "lr": 0.0002,
+    "kd": 2.0,
+    "calib_batches": 200,
+    "name": "bd_rung_l",
+    "device": "0",
+    "out": "/root/bd_rung_l.json"
+  }
+}

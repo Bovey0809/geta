@@ -97,12 +97,24 @@ recovery plateaus ~85-91 %. All consistent with **little structural redundancy**
 >
 > So the practical conclusion survives but the explanation is entirely
 > different: not "the removed computation is essential", but **"the elastic
-> dimension is too small a share of compute to pay for what it costs"**. That
-> points somewhere specific — make elastic a dimension that carries real
-> compute. Untested candidate with a live prior: C3k2-level depth (dropping
-> whole C3k blocks, where yolo26l's `n=2` gives headroom), given ~80 %
-> per-rung recovery on this axis.
-> Detail: `ofa/OFA_SUPERNET_PLAN.md`, `ofa/depth_retest.py`, `ofa/rung_train.py`.
+> dimension is too small a share of compute to pay for what it costs"**.
+>
+> **That diagnosis was then acted on and confirmed.** Applying the same axis one
+> level up — dropping *whole C3k blocks* from each C3k2's `.m` — saves **−30.4 %
+> MACs** on yolo26l (46.90 → 32.63 G, 2.4× the inner-depth saving) and recovers
+> **+0.2857** in one short run (0.1058 → **0.3915**, 71.8 % of the gap) — the
+> largest absolute recovery anywhere in this study. The method works best
+> exactly where the diagnosis said it would.
+>
+> It is nonetheless still short: **yolo26s (0.472 @ 11.42 G) dominates it** —
+> better accuracy at 2.9× less compute — and the s→m bar at 32.63 G is ~0.509.
+> Decisively, the *ceiling* is small: a sub-net matching its own teacher exactly
+> (impossible, it executes less compute) would score 0.5303 @ 32.63 G, beating
+> yolo26m by **+0.012 at −13 % MACs** — a win inside the noise of a training
+> recipe. So the remaining experiment is well-defined (a full 80-epoch run to
+> close the residual 0.119) but the prize is bounded and tiny.
+> Detail: `ofa/OFA_SUPERNET_PLAN.md`, `ofa/depth_retest.py`, `ofa/rung_train.py`,
+> `ofa/block_depth.py`.
 
 Make yolo26l depth-elastic (each C3k runs 2→1 inner residual bottlenecks; `elastic_yolo26.py`),
 sandwich-train so both the full (d=2) and shrunk (d=1) sub-nets are usable with no retraining.

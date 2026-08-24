@@ -650,10 +650,54 @@ is too small a fraction of compute to pay for the accuracy it costs.**
 
 That is a far more useful finding than "the ceiling is fundamental", because it
 says exactly what would have to change: **make elastic a dimension that actually
-carries compute.** The obvious untested candidate is C3k2-level depth — dropping
-whole C3k blocks rather than their inner bottlenecks — where yolo26l's `n=2`
-repeats give real headroom. Given ~80 % per-rung recovery on this axis, that is
-the one direction in this study with a live prior.
+carries compute.** Tested next — see below.
+
+### BLOCK-LEVEL DEPTH (C3k2 `.m`) — the best axis in the study, still short
+
+Dropping *whole C3k blocks* rather than their inner bottlenecks. Headroom exists
+only where the yaml repeats survive the depth multiplier: yolo26s has n=1
+everywhere (nothing to drop), yolo26l has n=2 in 7 blocks (L2/4/6/8/13/16/19).
+L22 has repeats=1, so the attention block is untouched.
+
+Structurally unlike inner depth: each `.m` item contributes one *concatenated
+segment*, so dropping it shrinks cv2's **input group count** rather than each
+group's size — hence `ChannelPlan.select(n_groups=)` and the `_ofa_in_groups`
+limit. Full depth verified bit-identical to stock.
+
+| | MACs | mAP |
+|---|---|---|
+| bd=2 (teacher) | 46.90 G | 0.5303 → 0.5112 after training |
+| **bd=1, untrained + recal** | **32.63 G** (**−30.4 %**) | 0.1058 |
+| **bd=1, trained** | 32.63 G | **0.3915** (**+0.2857**, 71.8 % of gap) |
+
+**+0.2857 is the largest absolute recovery of any run in this study**, and
+−30.4 % MACs is 2.4× the inner-depth saving. The method works best here, exactly
+as the "make the elastic dimension carry compute" diagnosis predicted.
+
+**But it is still Pareto-dominated, and the ceiling is only marginal.** Placing
+it on the family's compute/accuracy curve:
+
+| point | MACs | mAP | |
+|---|---|---|---|
+| yolo26s | 11.42 G | 0.472 | **dominates trained bd=1** — better mAP at 2.9× less compute |
+| yolo26m | 37.70 G | 0.518 | the point to beat |
+| **bd=1 trained** | 32.63 G | 0.3915 | −0.127 vs m, for −13 % MACs |
+| bd=1 *ceiling* | 32.63 G | ≤ 0.5303 | if training perfectly matched its teacher |
+
+The s→m interpolation bar at 32.63 G is **≈0.509**; we reach 0.3915. And the
+**absolute ceiling** — a sub-net exactly matching its own teacher, which it
+cannot since it executes strictly less compute — would be 0.5303 at 32.63 G,
+beating yolo26m by just **+0.012 at −13 % MACs**. So even flawless recovery buys
+a marginal Pareto point, and 0.119 of gap remains after this probe.
+
+**Where that leaves it.** This is the one configuration whose remaining question
+is worth stating precisely rather than dismissing: a full-scale run (the official
+80-epoch COCO fine-tune rather than 6 epochs on 15 %) would need to close most of
+the residual 0.119 to land a *weak* win over yolo26m. That is a real experiment
+with a real prior — the per-rung recovery is genuinely high — but the prize is
+small and bounded above by +0.012, which is inside the noise of a training
+recipe. Not recommended, and the reason is now the *size of the prize* rather
+than a failure of the method.
 
 ### P6 — Progressive-shrinking training → **GATE D** — **not run; probe answered it**
 Only meaningful once subnets *start* healthy — that's what makes gradients sane and is
