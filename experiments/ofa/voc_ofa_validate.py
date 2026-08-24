@@ -1,0 +1,292 @@
+"""Does our OFA pipeline work AT ALL? Settled on VOC, where redundancy exists.
+
+THE QUESTION THIS ANSWERS
+-------------------------
+Every OFA result in this study is negative, and all of them are on COCO. That
+is consistent with two very different causes:
+  (a) the pipeline is broken, or
+  (b) yolo26-on-COCO has no redundant capacity to exploit.
+187 correctness tests prove the *slicing* is exact. They say nothing about
+whether sandwich training can ever produce a usable sub-net.
+
+VOC discriminates. 16.5k images / 20 classes leaves yolo26s heavily
+OVER-parameterised, so redundancy certainly exists. It is also cheap enough to
+run TRUE OFA -- a supernet trained as a supernet from random init, sandwich-
+sampled throughout. Every elastic failure so far was *post-hoc* elasticity on an
+already-converged checkpoint, which is not what OFA prescribes.
+
+THE MEASUREMENT: "OFA TAX"
+--------------------------
+    tax(w) = mAP(model of width w trained ALONE) - mAP(supernet's width-w sub-net)
+
+That is the actual OFA promise: one training run, many deployable points, each
+close to its individually-trained twin. A small tax means the machinery works.
+A large tax on VOC -- where capacity is not the constraint -- means the approach
+itself is at fault, and no amount of COCO compute would have rescued it.
+
+Both arms get identical epochs, data, recipe and image size. Sub-nets are
+BN-recalibrated per width before evaluation, which this study established is
+mandatory (skipping it is what produced two retracted conclusions).
+
+Usage:
+  # gold baselines, one model per width, trained independently
+  python experiments/ofa/voc_ofa_validate.py baselines --widths 1.0 0.75 0.5 --epochs 100
+  # one supernet over the same widths
+  python experiments/ofa/voc_ofa_validate.py supernet  --widths 1.0 0.75 0.5 --epochs 100
+  # compare
+  python experiments/ofa/voc_ofa_validate.py report
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from pathlib import Path
+
+import torch
+import torch.nn.functional as F
+
+_HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(_HERE))
+
+from channel_plan import (  # noqa: E402
+    bn_stats_coverage,
+    count_active_params,
+    disable_fuse,
+    install_elastic_conv,
+    recalibrate,
+    set_width,
+)
+from elastic_attn import install_elastic_attention  # noqa: E402
+from plan_builder import plan_model  # noqa: E402
+
+from ultralytics import YOLO  # noqa: E402
+from ultralytics.nn.tasks import DetectionModel  # noqa: E402
+
+RESULTS = Path("/root/voc_ofa_results.json")
+
+# Modest, standard-ish recipe. Identical for BOTH arms -- the comparison is
+# between arms, so absolute values matter less than using one recipe throughout.
+RECIPE = dict(
+    optimizer="SGD", lr0=0.01, lrf=0.01, momentum=0.937, weight_decay=0.0005,
+    warmup_epochs=3.0, box=7.5, cls=0.5, dfl=1.5,
+    mosaic=1.0, mixup=0.0, copy_paste=0.0, scale=0.5, translate=0.1,
+    fliplr=0.5, hsv_h=0.015, hsv_s=0.7, hsv_v=0.4, close_mosaic=10,
+    imgsz=640, amp=True, val=False, plots=False,
+)
+
+
+def width_cfg(width: float) -> str:
+    """Write a yolo26 yaml whose 's' scale carries the requested width.
+
+    ultralytics only parses scale letters [nslmx], and rewrites
+    yolo26<letter>-<suffix>.yaml -> yolo26-<suffix>.yaml to find the shared
+    architecture file, so we hijack 's'.
+    """
+    import yaml as _y
+    base = _y.safe_load(open(_HERE / "yolo26-w375.yaml"))
+    base["scales"] = dict(base["scales"])
+    base["scales"]["s"] = [0.50, float(width), 1024]
+    tag = f"w{int(round(width * 1000)):04d}"
+    out_dir = Path("/root/voc_cfgs")
+    out_dir.mkdir(exist_ok=True)
+    shared = out_dir / f"yolo26-{tag}.yaml"
+    _y.safe_dump(base, open(shared, "w"), sort_keys=False)
+    handle = out_dir / f"yolo26s-{tag}.yaml"
+    _y.safe_dump(base, open(handle, "w"), sort_keys=False)
+    return str(handle)
+
+
+def load(path=RESULTS) -> dict:
+    return json.loads(path.read_text()) if path.exists() else {}
+
+
+def save(d: dict, path=RESULTS) -> None:
+    path.write_text(json.dumps(d, indent=2))
+
+
+def calib_batches(data: str, batch: int, n: int):
+    """Re-iterable stream of TRAIN images for BN recalibration."""
+    from ultralytics.cfg import get_cfg
+    from ultralytics.data.build import build_yolo_dataset
+    from ultralytics.data.utils import check_det_dataset
+
+    d = check_det_dataset(data)
+    cfg = get_cfg()
+    cfg.imgsz, cfg.rect = 640, False
+    ds = build_yolo_dataset(cfg, d["train"], batch, d, mode="val", stride=32)
+    g = torch.Generator().manual_seed(0)
+    idx = torch.randperm(len(ds), generator=g)[: n * batch].tolist()
+
+    class Stream:
+        def __len__(self):
+            return n
+
+        def __iter__(self):
+            dl = torch.utils.data.DataLoader(
+                torch.utils.data.Subset(ds, idx), batch_size=batch, shuffle=False,
+                num_workers=8, collate_fn=getattr(ds, "collate_fn", None),
+                drop_last=True)
+            for b in dl:
+                yield b["img"].float() / 255.0
+    return Stream()
+
+
+def cmd_baselines(a):
+    res = load()
+    res.setdefault("baselines", {})
+    for w in a.widths:
+        cfg = width_cfg(w)
+        name = f"voc_base_w{w}"
+        print(f"\n=== baseline width={w} ({cfg}) ===", flush=True)
+        y = YOLO(cfg)
+        params = sum(p.numel() for p in y.model.parameters()) / 1e6
+        y.train(data=a.data, epochs=a.epochs, batch=a.batch, name=name,
+                device=a.device, **RECIPE)
+        m = y.val(data=a.data, imgsz=640, batch=a.batch, device=a.device,
+                  plots=False, verbose=False)
+        res["baselines"][str(w)] = {"params_M": params,
+                                    "map5095": float(m.box.map),
+                                    "map50": float(m.box.map50)}
+        print(f"  width={w}: {params:.3f}M  mAP50-95={float(m.box.map):.4f} "
+              f"mAP50={float(m.box.map50):.4f}", flush=True)
+        save(res)
+        del y
+        torch.cuda.empty_cache()
+    return 0
+
+
+def patch_sandwich(trainer, widths, kd_lambda):
+    """Sandwich loss: max width takes the real loss and feeds KD to the rest."""
+    m = trainer.model
+    plan_model(m)
+    if getattr(trainer, "ema", None) is not None:
+        trainer.ema.enabled = False
+    cap = {}
+    m.model[-1].register_forward_pre_hook(
+        lambda _mod, args: cap.__setitem__("f", args[0]))
+    orig = m.loss
+    ctr = {"n": 0}
+
+    def sloss(batch, preds=None):
+        set_width(m, widths[0])
+        l_max, items = orig(batch) if preds is None else orig(batch, preds)
+        tfeat = [f.detach() for f in cap["f"]]
+        total = l_max
+        for w in widths[1:]:
+            set_width(m, w)
+            l_s, _ = orig(batch) if preds is None else orig(batch, preds)
+            kd = 0
+            for s, t in zip(cap["f"], tfeat):
+                kd = kd + F.mse_loss(s, t[:, : s.shape[1]])
+            total = total + l_s + kd_lambda * kd
+        set_width(m, widths[0])
+        ctr["n"] += 1
+        if ctr["n"] <= 2 or ctr["n"] % 500 == 0:
+            print(f"[sw {ctr['n']}] l_max={l_max.sum().item():.3f} "
+                  f"l_small={l_s.sum().item():.3f} kd={float(kd):.4f}", flush=True)
+        return total, items
+
+    m.loss = sloss
+    print(f"[sandwich] widths={widths} kd={kd_lambda}", flush=True)
+
+
+def cmd_supernet(a):
+    res = load()
+    cfg = width_cfg(max(a.widths))
+    name = "voc_supernet"
+    print(f"\n=== supernet over widths {a.widths} ({cfg}) ===", flush=True)
+    y = YOLO(cfg)
+    y.add_callback("on_train_start",
+                   lambda tr: patch_sandwich(tr, a.widths, a.kd))
+    y.add_callback("on_train_epoch_end",
+                   lambda tr: tr.ema.ema.load_state_dict(tr.model.state_dict())
+                   if getattr(tr, "ema", None) is not None else None)
+    y.train(data=a.data, epochs=a.epochs, batch=a.batch, name=name,
+            device=a.device, **RECIPE)
+
+    ckpt = sorted(Path("/root/runs/detect").glob(f"{name}*/weights/last.pt"),
+                  key=lambda p: p.stat().st_mtime)[-1]
+    print(f"supernet ckpt: {ckpt}", flush=True)
+
+    calib = calib_batches(a.data, a.batch, 100)
+    res.setdefault("supernet", {})
+    for w in a.widths:
+        yq = YOLO(str(ckpt))
+        mm = yq.model.to(f"cuda:{a.device}")
+        plan_model(mm)
+        disable_fuse(mm)
+        recalibrate(mm, calib, w, device=torch.device(f"cuda:{a.device}"))
+        have, need = bn_stats_coverage(mm, w)
+        set_width(mm, w)
+        r = yq.val(data=a.data, imgsz=640, batch=a.batch, device=a.device,
+                   plots=False, verbose=False)
+        res["supernet"][str(w)] = {
+            "params_M": count_active_params(mm, w) / 1e6,
+            "map5095": float(r.box.map), "map50": float(r.box.map50),
+            "bn_stats": f"{have}/{need}"}
+        print(f"  supernet w={w}: mAP50-95={float(r.box.map):.4f}", flush=True)
+        save(res)
+        del yq, mm
+        torch.cuda.empty_cache()
+    return 0
+
+
+def cmd_report(a):
+    res = load()
+    b, s = res.get("baselines", {}), res.get("supernet", {})
+    if not b or not s:
+        print("need both arms; run `baselines` and `supernet` first")
+        return 1
+    print("\n" + "=" * 72)
+    print("OFA TAX on VOC  (trained-alone minus supernet-subnet)")
+    print("=" * 72)
+    print(f"{'width':>7} {'params':>9} {'alone':>9} {'supernet':>9} {'tax':>9}")
+    taxes = []
+    for w in sorted(b, key=float, reverse=True):
+        if w not in s:
+            continue
+        ba, su = b[w]["map5095"], s[w]["map5095"]
+        tax = ba - su
+        taxes.append((float(w), tax))
+        print(f"{w:>7} {b[w]['params_M']:>8.3f}M {ba:>9.4f} {su:>9.4f} {tax:>+9.4f}")
+    if taxes:
+        worst = max(t for _, t in taxes)
+        print(f"\nworst tax: {worst:+.4f}")
+        if worst < 0.02:
+            print("VERDICT: pipeline VALIDATED. Sub-nets land within 0.02 of their\n"
+                  "individually-trained twins, so the machinery does deliver the OFA\n"
+                  "promise. The COCO failure is therefore about yolo26/COCO having no\n"
+                  "redundant capacity, not about broken code.")
+        elif worst < 0.05:
+            print("VERDICT: partial. The machinery works but pays a real cost; the COCO\n"
+                  "result is then a mix of that cost and genuine lack of redundancy.")
+        else:
+            print("VERDICT: pipeline does NOT deliver even where redundancy certainly\n"
+                  "exists. The approach itself is at fault -- no amount of COCO compute\n"
+                  "would have rescued it, and the earlier negatives are not evidence\n"
+                  "about yolo26's capacity.")
+    return 0
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("cmd", choices=["baselines", "supernet", "report"])
+    ap.add_argument("--data", default="/root/autodl-tmp/VOC/VOC.yaml")
+    ap.add_argument("--widths", type=float, nargs="+", default=[1.0, 0.75, 0.5])
+    ap.add_argument("--epochs", type=int, default=100)
+    ap.add_argument("--batch", type=int, default=64)
+    ap.add_argument("--kd", type=float, default=2.0)
+    ap.add_argument("--device", default="0")
+    a = ap.parse_args()
+
+    install_elastic_conv()
+    install_elastic_attention()
+    a.widths = sorted(a.widths, reverse=True)
+    return {"baselines": cmd_baselines, "supernet": cmd_supernet,
+            "report": cmd_report}[a.cmd](a)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
