@@ -1,0 +1,43 @@
+{
+  "baselines": {
+    "0.5": {
+      "params_M": 10.009784,
+      "map5095": 0.5991275341486975,
+      "map50": 0.7949269097898093
+    },
+    "0.375": {
+      "params_M": 5.654856,
+      "map5095": 0.5792329506523668,
+      "map50": 0.785020136146299
+    },
+    "0.25": {
+      "params_M": 2.57228,
+      "map5095": 0.5329012102671762,
+      "map50": 0.7448477780007967
+    }
+  },
+  "_baselines_note": "carried over from the first VOC run; that arm was valid (independently trained at the correct absolute widths). Only the supernet arm was rerun, after fixing absolute-width vs elastic-fraction confusion.",
+  "supernet": {
+    "0.5": {
+      "fraction": 1.0,
+      "params_M": 9.963344,
+      "map5095": 0.5706709510778931,
+      "map50": 0.7715141260020479,
+      "bn_stats": "96/96"
+    },
+    "0.375": {
+      "fraction": 0.75,
+      "params_M": 5.834016,
+      "map5095": 0.5579180183141683,
+      "map50": 0.7609041823483096,
+      "bn_stats": "96/96"
+    },
+    "0.25": {
+      "fraction": 0.5,
+      "params_M": 2.827376,
+      "map5095": 0.5336851974948409,
+      "map50": 0.7395316047576234,
+      "bn_stats": "96/96"
+    }
+  }
+}
