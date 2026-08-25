@@ -201,13 +201,32 @@ def patch_sandwich(trainer, widths, kd_lambda):
 
 
 def cmd_supernet(a):
+    """Train ONE supernet spanning the same ABSOLUTE widths as the baselines.
+
+    CRITICAL AND EASY TO GET WRONG: `width_cfg(w)` builds an architecture whose
+    absolute yolo26 width multiplier is w, but `set_width(model, f)` applies an
+    elastic FRACTION of that architecture's own width. They are different
+    quantities. The supernet is built at the LARGEST absolute width, so to reach
+    absolute width w its fraction must be w / max(widths):
+
+        widths [0.50, 0.375, 0.25]  ->  fractions [1.0, 0.75, 0.5]
+
+    Passing the absolute widths straight to set_width (as an earlier version
+    did) builds sub-nets at absolute 0.25/0.1875/0.125 -- roughly 3.5x smaller
+    than the baselines they are compared against -- AND makes the sandwich's
+    "max" arm fraction 0.50, so the full supernet is never trained and the KD
+    teacher is itself a sub-net. The whole comparison is then meaningless.
+    """
     res = load()
-    cfg = width_cfg(max(a.widths))
+    sup_w = max(a.widths)
+    cfg = width_cfg(sup_w)
+    fracs = [w / sup_w for w in a.widths]
     name = "voc_supernet"
-    print(f"\n=== supernet over widths {a.widths} ({cfg}) ===", flush=True)
+    print(f"\n=== supernet at absolute width {sup_w} ({cfg}) ===")
+    print(f"    absolute widths {a.widths} -> elastic fractions {fracs}", flush=True)
     y = YOLO(cfg)
     y.add_callback("on_train_start",
-                   lambda tr: patch_sandwich(tr, a.widths, a.kd))
+                   lambda tr: patch_sandwich(tr, fracs, a.kd))
     y.add_callback("on_train_epoch_end",
                    lambda tr: tr.ema.ema.load_state_dict(tr.model.state_dict())
                    if getattr(tr, "ema", None) is not None else None)
@@ -220,21 +239,24 @@ def cmd_supernet(a):
 
     calib = calib_batches(a.data, a.batch, 100)
     res.setdefault("supernet", {})
-    for w in a.widths:
+    for w, f in zip(a.widths, fracs):
         yq = YOLO(str(ckpt))
         mm = yq.model.to(f"cuda:{a.device}")
         plan_model(mm)
         disable_fuse(mm)
-        recalibrate(mm, calib, w, device=torch.device(f"cuda:{a.device}"))
-        have, need = bn_stats_coverage(mm, w)
-        set_width(mm, w)
+        recalibrate(mm, calib, f, device=torch.device(f"cuda:{a.device}"))
+        have, need = bn_stats_coverage(mm, f)
+        set_width(mm, f)
         r = yq.val(data=a.data, imgsz=640, batch=a.batch, device=a.device,
                    plots=False, verbose=False)
         res["supernet"][str(w)] = {
-            "params_M": count_active_params(mm, w) / 1e6,
+            "fraction": f,
+            "params_M": count_active_params(mm, f) / 1e6,
             "map5095": float(r.box.map), "map50": float(r.box.map50),
             "bn_stats": f"{have}/{need}"}
-        print(f"  supernet w={w}: mAP50-95={float(r.box.map):.4f}", flush=True)
+        print(f"  supernet abs_w={w} (frac {f:.3f}): "
+              f"{count_active_params(mm, f)/1e6:.3f}M "
+              f"mAP50-95={float(r.box.map):.4f}", flush=True)
         save(res)
         del yq, mm
         torch.cuda.empty_cache()
@@ -250,15 +272,28 @@ def cmd_report(a):
     print("\n" + "=" * 72)
     print("OFA TAX on VOC  (trained-alone minus supernet-subnet)")
     print("=" * 72)
-    print(f"{'width':>7} {'params':>9} {'alone':>9} {'supernet':>9} {'tax':>9}")
-    taxes = []
+    print(f"{'width':>7} {'alone(M)':>9} {'super(M)':>9} {'alone':>9} "
+          f"{'supernet':>9} {'tax':>9}")
+    taxes, mismatched = [], []
     for w in sorted(b, key=float, reverse=True):
         if w not in s:
             continue
+        pa, ps = b[w]["params_M"], s[w]["params_M"]
         ba, su = b[w]["map5095"], s[w]["map5095"]
         tax = ba - su
+        # The arms must be the SAME architecture. A size gap means the width
+        # bookkeeping is wrong and the tax is not a tax at all.
+        if abs(pa - ps) / max(pa, 1e-9) > 0.05:
+            mismatched.append((w, pa, ps))
         taxes.append((float(w), tax))
-        print(f"{w:>7} {b[w]['params_M']:>8.3f}M {ba:>9.4f} {su:>9.4f} {tax:>+9.4f}")
+        print(f"{w:>7} {pa:>8.3f}M {ps:>8.3f}M {ba:>9.4f} {su:>9.4f} {tax:>+9.4f}")
+    if mismatched:
+        print("\nABORT: arms are NOT size-matched -- the supernet sub-net and the")
+        print("baseline must be the same architecture for a tax to mean anything.")
+        for w, pa, ps in mismatched:
+            print(f"  width {w}: baseline {pa:.3f}M vs supernet {ps:.3f}M")
+        print("This indicates absolute-width / elastic-fraction confusion.")
+        return 1
     if taxes:
         worst = max(t for _, t in taxes)
         print(f"\nworst tax: {worst:+.4f}")

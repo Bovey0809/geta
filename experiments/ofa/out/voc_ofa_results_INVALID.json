@@ -1,0 +1,42 @@
+{
+  "baselines": {
+    "0.5": {
+      "params_M": 10.009784,
+      "map5095": 0.5991275341486975,
+      "map50": 0.7949269097898093
+    },
+    "0.375": {
+      "params_M": 5.654856,
+      "map5095": 0.5792329506523668,
+      "map50": 0.785020136146299
+    },
+    "0.25": {
+      "params_M": 2.57228,
+      "map5095": 0.5329012102671762,
+      "map50": 0.7448477780007967
+    }
+  },
+  "supernet": {
+    "0.5": {
+      "params_M": 2.827376,
+      "map5095": 0.5120600507715705,
+      "map50": 0.7234705041259413,
+      "bn_stats": "96/96"
+    },
+    "0.375": {
+      "params_M": 1.745064,
+      "map5095": 0.4925604333056057,
+      "map50": 0.7041293932486985,
+      "bn_stats": "96/96"
+    },
+    "0.25": {
+      "params_M": 0.943424,
+      "map5095": 0.4388908777174489,
+      "map50": 0.6536768509456923,
+      "bn_stats": "96/96"
+    }
+  },
+  "_INVALID": "DO NOT USE. The supernet arm passed ABSOLUTE widths to set_width(), which takes an elastic FRACTION of the supernet's own width. The supernet was built at absolute width 0.50, so fractions 0.50/0.375/0.25 produced absolute widths 0.25/0.1875/0.125 -- roughly 3.5x smaller than the baselines they were compared against (see the params_M columns). The sandwich's max arm was also fraction 0.50, so the full supernet was never trained and the KD teacher was itself a sub-net. The +0.094 'OFA tax' this produced is meaningless.",
+  "_only_near_match": "supernet frac-0.50 sub-net (2.827M, 0.5121) vs the width-0.25 baseline (2.572M, 0.5329): tax ~+0.021, and the sub-net is 10% LARGER while scoring lower, so size-matched it is somewhat worse. Suggestive of a real but moderate tax; still contaminated by the sub-net teacher.",
+  "_baselines_are_valid": "The three baselines were trained independently at the correct absolute widths and ARE valid; only the supernet arm needs rerunning. Note their params_M were measured at the yaml default nc=80, not VOC's nc=20 -- cosmetic, does not affect mAP."
+}
