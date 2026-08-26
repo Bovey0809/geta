@@ -64,7 +64,7 @@ from plan_builder import plan_model  # noqa: E402
 from ultralytics import YOLO  # noqa: E402
 from ultralytics.nn.tasks import DetectionModel  # noqa: E402
 
-RESULTS = Path("/root/voc_ofa_results.json")
+RESULTS = Path("/root/voc_ofa_results.json")  # overridable via --results
 
 # Modest, standard-ish recipe. Identical for BOTH arms -- the comparison is
 # between arms, so absolute values matter less than using one recipe throughout.
@@ -342,11 +342,17 @@ def main() -> int:
     ap.add_argument("--epochs", type=int, default=100)
     ap.add_argument("--batch", type=int, default=64)
     ap.add_argument("--kd", type=float, default=2.0)
+    ap.add_argument("--results", default=None,
+                    help="results json path; lets the two arms run on separate
+                         boxes and be merged afterwards")
     ap.add_argument("--device", default="0")
     a = ap.parse_args()
 
     install_elastic_conv()
     install_elastic_attention()
+    if a.results:
+        global RESULTS
+        RESULTS = Path(a.results)
     a.widths = sorted(a.widths, reverse=True)
     return {"baselines": cmd_baselines, "supernet": cmd_supernet,
             "report": cmd_report}[a.cmd](a)
