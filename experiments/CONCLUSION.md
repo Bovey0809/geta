@@ -246,6 +246,49 @@ matching this study's own finding that sliced-init sub-nets start near zero and
 recover only partially. The clean test — from-scratch arms at matched budget,
 ~60–90 h GPU — was not run. Data: `ofa/out/w375_coco.json`.
 
+## Paradigm 6 — VOC control: does our OFA pipeline work AT ALL?
+Every result above is on COCO and negative, which is consistent with two very
+different causes: **(a)** the pipeline is broken, or **(b)** yolo26-on-COCO has
+no redundant capacity. 187 correctness tests prove the *slicing* is exact; they
+say nothing about whether sandwich training can yield a usable sub-net. That
+gap stayed open for the whole study.
+
+VOC discriminates: 16.5k images / 20 classes leaves yolo26s heavily
+over-parameterised, so redundancy certainly exists. It is also cheap enough to
+run **TRUE OFA** — a supernet trained *as* a supernet from random init,
+sandwich-sampled throughout — which every COCO experiment failed to do (all of
+them applied elasticity *post-hoc* to an already-converged checkpoint).
+
+**OFA tax** = mAP(width trained alone) − mAP(supernet sub-net at that width):
+
+| width | params | alone | supernet | tax |
+|---|---|---|---|---|
+| 0.50 | 9.96 M | 0.5991 | 0.5707 | **+0.0285** |
+| 0.375 | 5.8 M | 0.5792 | 0.5579 | **+0.0213** |
+| 0.25 | 2.8 M | 0.5329 | **0.5337** | **−0.0008** |
+
+**The pipeline works.** At the smallest width the sub-net matches its
+individually-trained twin outright. The tax *grows with width* — the supernet
+gives up its largest configuration to serve the smaller ones, the classic OFA
+trade. One training run yields three deployable models, each within 0.029 of a
+dedicated one. (Sub-nets are slightly *larger* than their baselines at low
+width because the Detect head does not shrink, so these taxes are conservative.)
+
+**What this does and does not license.** It rules out "the code never worked" —
+the machinery demonstrably delivers where capacity is slack. But it does **not**
+cleanly prove the COCO failures were purely about redundancy, because two things
+differ at once: VOC had (i) an over-parameterised task **and** (ii) true
+from-scratch supernet training, while COCO had neither. **True from-scratch OFA
+on COCO was never run** (2–3× a full run). So the COCO negatives are best read
+as *some combination* of genuine lack of slack and the post-hoc protocol —
+with this study's own rung probes showing post-hoc training recovers only
+partially (+0.044 width, +0.274 depth per rung).
+
+Two runs were needed: the first was invalid (absolute widths passed where an
+elastic *fraction* was expected, making every sub-net ~3.5× smaller than its
+baseline and leaving the full supernet untrained). Archived as
+`ofa/out/voc_ofa_results_INVALID.json`. Data: `ofa/out/voc_ofa_results.json`.
+
 ## Unified conclusion (revised 2026-08-20)
 **What holds:** structured pruning deletes capacity YOLO26 actually uses and a
 50-epoch full-COCO fine-tune recovers only ~80 % of dense-x (0.450 at default-m's
