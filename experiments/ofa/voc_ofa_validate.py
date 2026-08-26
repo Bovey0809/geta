@@ -343,8 +343,8 @@ def main() -> int:
     ap.add_argument("--batch", type=int, default=64)
     ap.add_argument("--kd", type=float, default=2.0)
     ap.add_argument("--results", default=None,
-                    help="results json path; lets the two arms run on separate
-                         boxes and be merged afterwards")
+                    help="results json path; lets the two arms run on separate "
+                         "boxes and be merged afterwards")
     ap.add_argument("--device", default="0")
     a = ap.parse_args()
 
