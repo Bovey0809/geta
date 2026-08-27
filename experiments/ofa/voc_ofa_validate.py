@@ -42,6 +42,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import pathlib
 from pathlib import Path
 
 import torch
@@ -106,12 +107,21 @@ def width_cfg(width: float) -> str:
     return str(handle)
 
 
-def load(path=RESULTS) -> dict:
-    return json.loads(path.read_text()) if path.exists() else {}
+def load(path=None) -> dict:
+    """Read results. NOTE: resolves RESULTS at CALL time, not def time.
+
+    Using `path=RESULTS` as a default binds the module-level value when the
+    function is DEFINED, so a later `RESULTS = Path(args.results)` in main()
+    silently has no effect and everything writes to the original filename.
+    That is exactly what happened on the first COCO run.
+    """
+    p = pathlib.Path(path) if path else RESULTS
+    return json.loads(p.read_text()) if p.exists() else {}
 
 
-def save(d: dict, path=RESULTS) -> None:
-    path.write_text(json.dumps(d, indent=2))
+def save(d: dict, path=None) -> None:
+    p = pathlib.Path(path) if path else RESULTS
+    p.write_text(json.dumps(d, indent=2))
 
 
 def calib_batches(data: str, batch: int, n: int):
