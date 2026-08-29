@@ -1,0 +1,86 @@
+{
+  "experiment": "true from-scratch OFA on COCO (supernet vs per-width baselines)",
+  "protocol": {
+    "epochs": 100,
+    "init": "random",
+    "dataset": "COCO train2017 / val2017",
+    "supernet": "sandwich sampling from random init, fractions 1.0/0.75/0.5 of a w=0.5 supernet",
+    "baselines": "each width trained alone, identical recipe/epochs/imgsz",
+    "eval": "per-width BN recalibration (96/96 layers) before every subnet eval"
+  },
+  "baselines": {
+    "0.5": {
+      "params_M": 10.009784,
+      "map5095": 0.42471150767189625,
+      "map50": 0.5847683748172411
+    },
+    "0.375": {
+      "params_M": 5.654856,
+      "map5095": 0.3972052388447952,
+      "map50": 0.5520995729492642
+    },
+    "0.25": {
+      "params_M": 2.57228,
+      "map5095": 0.34704211022088427,
+      "map50": 0.49266582047218394
+    }
+  },
+  "supernet": {
+    "0.5": {
+      "fraction": 1.0,
+      "params_M": 10.009784,
+      "map5095": 0.40692407491819443,
+      "map50": 0.5655376831971578,
+      "bn_stats": "96/96"
+    },
+    "0.375": {
+      "fraction": 0.75,
+      "params_M": 5.880456,
+      "map5095": 0.38652050191814896,
+      "map50": 0.5419522243959995,
+      "bn_stats": "96/96"
+    },
+    "0.25": {
+      "fraction": 0.5,
+      "params_M": 2.873816,
+      "map5095": 0.3439238079664236,
+      "map50": 0.4931430175416233,
+      "bn_stats": "96/96"
+    }
+  },
+  "tax": {
+    "0.5": {
+      "alone_map5095": 0.42471150767189625,
+      "alone_params_M": 10.009784,
+      "ofa_map5095": 0.40692407491819443,
+      "ofa_params_M": 10.009784,
+      "tax_raw": 0.0178,
+      "tax_rel_pct": 4.2,
+      "params_excess_M": 0.0,
+      "tax_size_matched": 0.0178,
+      "tax_size_matched_rel_pct": 4.2
+    },
+    "0.375": {
+      "alone_map5095": 0.3972052388447952,
+      "alone_params_M": 5.654856,
+      "ofa_map5095": 0.38652050191814896,
+      "ofa_params_M": 5.880456,
+      "tax_raw": 0.0107,
+      "tax_rel_pct": 2.7,
+      "params_excess_M": 0.226,
+      "tax_size_matched": 0.0121,
+      "tax_size_matched_rel_pct": 3.0
+    },
+    "0.25": {
+      "alone_map5095": 0.34704211022088427,
+      "alone_params_M": 2.57228,
+      "ofa_map5095": 0.3439238079664236,
+      "ofa_params_M": 2.873816,
+      "tax_raw": 0.0031,
+      "tax_rel_pct": 0.9,
+      "params_excess_M": 0.302,
+      "tax_size_matched": 0.008,
+      "tax_size_matched_rel_pct": 2.3
+    }
+  }
+}

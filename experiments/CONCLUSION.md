@@ -27,10 +27,21 @@ own baseline.** You are consistently better off picking the right-sized default 
 > The measured obstacle is structural, not a tuning failure: **the widths that
 > survive save almost no parameters (w ≥ 0.96 → ≤ 7 %), and the widths that save
 > real parameters are dead (w ≤ 0.875).** Full detail: `ofa/OFA_SUPERNET_PLAN.md`.
+> *(Scope, added 2026-08-29: that holds for **post-hoc** elasticity only. Trained
+> from scratch as a supernet, the deepest cut here — fraction 0.5 — scores
+> **0.3439**, not 0. See Paradigm 7.)*
 >
 > The depth-elastic `0.0` (Paradigm 2) remains **untested-suspect** — same class of
 > bug was found in its sibling, and it was evaluated with full-depth BN stats.
 > **Paradigm 1 (pruning) still stands** — it had a real 50-epoch full-COCO fine-tune.
+
+> **UPDATE (2026-08-29) — the "COCO has no slack" reading is RETRACTED.** True
+> from-scratch OFA on COCO (**Paradigm 7**) yields sub-nets within **2–4 % relative**
+> of individually-trained twins at every width, including the ones that "save real
+> parameters." Every earlier COCO elastic result — including the ones quoted in the
+> blockquote above — was measured **post-hoc on an already-converged checkpoint**.
+> That protocol, not yolo26's capacity, is what produced the dead widths. The Pareto
+> verdict is unchanged: OFA still never beats a dedicated model at the same width.
 
 Hardware: single **RTX PRO 6000 Blackwell 96 GB** (final runs); earlier work on RTX 3080 Ti 12 GB.
 COCO val2017, mAP50-95, imgsz 640.
@@ -272,35 +283,117 @@ individually-trained twin outright. The tax *grows with width* — the supernet
 gives up its largest configuration to serve the smaller ones, the classic OFA
 trade. One training run yields three deployable models, each within 0.029 of a
 dedicated one. (Sub-nets are slightly *larger* than their baselines at low
-width because the Detect head does not shrink, so these taxes are conservative.)
+width because the Detect head does not shrink. **Corrected 2026-08-29:** that makes
+these taxes *optimistic*, not conservative — a size-matched sub-net would score
+lower, so the true tax is somewhat higher. The COCO table in Paradigm 7 carries an
+explicit size-matched column.)
 
 **What this does and does not license.** It rules out "the code never worked" —
 the machinery demonstrably delivers where capacity is slack. But it does **not**
 cleanly prove the COCO failures were purely about redundancy, because two things
 differ at once: VOC had (i) an over-parameterised task **and** (ii) true
 from-scratch supernet training, while COCO had neither. **True from-scratch OFA
-on COCO was never run** (2–3× a full run). So the COCO negatives are best read
-as *some combination* of genuine lack of slack and the post-hoc protocol —
-with this study's own rung probes showing post-hoc training recovers only
-partially (+0.044 width, +0.274 depth per rung).
+on COCO was never run** (2–3× a full run), so the COCO negatives were best read
+as *some combination* of genuine lack of slack and the post-hoc protocol.
+
+> **CLOSED (2026-08-29).** That run has now been done — see **Paradigm 7**. It
+> holds the task fixed (COCO) and varies only the protocol, and it comes out
+> decisively on the protocol side: the tax on COCO is **smaller** than on VOC.
+> The "genuine lack of slack" half of the disjunction is retracted.
 
 Two runs were needed: the first was invalid (absolute widths passed where an
 elastic *fraction* was expected, making every sub-net ~3.5× smaller than its
 baseline and leaving the full supernet untrained). Archived as
 `ofa/out/voc_ofa_results_INVALID.json`. Data: `ofa/out/voc_ofa_results.json`.
 
-## Unified conclusion (revised 2026-08-20)
+## Paradigm 7 — true from-scratch OFA on COCO (**resolves the study's central ambiguity**)
+Paradigm 6 left one confound standing: VOC changed *two* things at once — an
+over-parameterised task **and** true from-scratch supernet training. This run
+removes the first. Same COCO, same architecture family, same budget, both arms
+from **random init**; the only difference between the arms is whether the network
+was trained *as* a supernet.
+
+**Protocol.** Supernet = width 0.5, sandwich-sampled from random init at fractions
+1.0 / 0.75 / 0.5 (absolute widths 0.50 / 0.375 / 0.25). Baselines = each of those
+three widths trained alone under an identical recipe, epochs (100), imgsz and data.
+Every sub-net BN-recalibrated for its own configuration before eval (**96/96**
+layers at all three widths) — the omission that produced two retracted conclusions
+earlier in this study.
+
+| width | alone (params → mAP) | OFA sub-net (params → mAP) | tax | rel | size-matched tax |
+|---|---|---|---|---|---|
+| 0.50 | 10.010 M → 0.4247 | 10.010 M → 0.4069 | **+0.0178** | 4.2 % | +0.0178 (4.2 %) |
+| 0.375 | 5.655 M → 0.3972 | 5.880 M → 0.3865 | **+0.0107** | 2.7 % | +0.0121 (3.0 %) |
+| 0.25 | 2.572 M → 0.3470 | 2.874 M → 0.3439 | **+0.0031** | 0.9 % | +0.0080 (2.3 %) |
+
+The sub-nets at 0.375 and 0.25 are *larger* than their baselines (the Detect head
+does not shrink), so the raw tax is **optimistic**. The size-matched column charges
+that excess back at the local slope of the from-scratch baseline curve
+(0.0063 mAP/M above 5.66 M, 0.0163 mAP/M above 2.57 M). Either way the tax is
+**2–4 % relative across the whole ladder**.
+
+**The headline: on COCO, true from-scratch OFA works.** Compare like for like, same
+dataset and same architecture — post-hoc elasticity on a converged checkpoint scored
+**0.0000**; a supernet trained as a supernet from scratch scores **0.3439** at the
+same fraction. Nothing about yolo26's capacity changed between those two numbers.
+**The protocol was the problem.** Note also that the tax is *smaller* on COCO than on
+VOC (+0.0178 vs +0.0285 at the top width) — the opposite of what "COCO has no slack"
+predicts.
+
+**But it is not a Pareto win.** The OFA sub-net never beats its own baseline at any
+width, and the small sub-net is nowhere near the large one (2.874 M → 0.3439 vs
+10.010 M → 0.4069). OFA's value here is **logistical, not architectural**: one
+training run instead of three, giving three deployable operating points at ~2–4 %
+relative mAP each. It does not produce a model that is both smaller *and* better.
+
+**Scope — read this before quoting the numbers.** This is a 100-epoch from-scratch
+protocol. It is internally matched (both arms identical) but it is **not** comparable
+to the official checkpoints in the baselines table above: w=0.5 trained alone reaches
+0.4247 here versus **0.472** for the released yolo26s, which gets Objects365
+pretraining and a much longer schedule. What this run licenses is the *retraction* —
+the 0.0000s were protocol artefacts, not capacity limits. It does **not** license the
+claim that the tax stays at 2–4 % under full official convergence, where the
+baselines are stronger and harder to match. That test has not been run.
+
+**Recipe (identical on both arms, recovered from the trainer args):** model built
+from a `.yaml` so **random init**, epochs 100, batch 64, imgsz 640, SGD lr0 0.01,
+close_mosaic 10, COCO train2017/val2017. Note this is the stock recipe, *not* the
+official MuSGD schedule the released checkpoints use — another reason the absolute
+mAPs here sit below the released ones while the *comparison between arms* stays valid.
+
+Data: `ofa/out/coco_ofa_results.json` (merged, with the size-matched correction);
+raw arms in `ofa/out/coco_base_raw.json` and `ofa/out/coco_sup_raw.json`; baseline
+log in `ofa/out/coco_base.log`; supernet trainer args in `ofa/out/coco_sup_args.txt`.
+
+## Unified conclusion (revised 2026-08-29)
 **What holds:** structured pruning deletes capacity YOLO26 actually uses and a
 50-epoch full-COCO fine-tune recovers only ~80 % of dense-x (0.450 at default-m's
 param count vs m's 0.518). Post-hoc KD-fine-tuning of a right-sized student
 doesn't lift it above its own baseline either. For **these** interventions, the
 right-sized default wins.
 
-**What does NOT hold:** the stronger claim that YOLO26 is Pareto-efficient against
-*any* cheap intervention. Both elastic-OFA "dead ends" were measured with buggy
-slicing (and, for width, corrupted BN statistics), so they are **not evidence**
-about capacity. Width-elastic is reopened (`ofa/OFA_SUPERNET_PLAN.md`); depth-elastic
-deserves one re-test.
+**RETRACTED (2026-08-29) — "yolo26-on-COCO has no redundant capacity for OFA."**
+This study leaned on that reading to explain a string of 0.0000s on COCO. It is
+wrong. Paradigm 7 ran the experiment that was always missing — a supernet trained
+*as* a supernet from random init on COCO — and its sub-nets land within **2–4 %
+relative** of individually-trained twins at every width. The 0.0000s came from
+applying elasticity **post-hoc to an already-converged checkpoint**, which is not
+what OFA prescribes. Three mechanisms were blamed before the protocol was: buggy
+slicing, corrupted BN statistics, and "no slack." The first two were real and were
+fixed; the third never was.
+
+**What still does NOT hold:** that OFA buys a *Pareto win*. It doesn't. Trained
+correctly, the supernet's sub-nets are at best equal to — never better than — the
+same width trained alone (Paradigm 7: −0.0031 to −0.0178 mAP), and the small sub-nets
+stay far below the large ones. OFA's payoff is **one training run covering three
+deployment points at ~2–4 % relative mAP each** — a real engineering benefit, not a
+smaller-and-better model. Nothing in this study produces a yolo26 variant that is
+simultaneously smaller than a default *and* better than it.
+
+**Limits of the retraction.** Paradigm 7 matches its two arms to each other, not to
+the released models: 100 epochs, random init, no Objects365. It establishes that the
+elastic failures were procedural. It does **not** establish that the 2–4 % tax
+survives at official convergence, where the baselines are considerably stronger.
 
 The one method improvement that survived controlled testing: **CWD channel-wise KL
 beats the stock score-weighted L2 in Ultralytics' distillation loss** (upstream
@@ -323,3 +416,10 @@ YOLO26 (attention / concat / NMS-free head don't INT8-fuse).
   `width_eval.py`, `bn_recal.py`, `channel_sort.py` (partial). Full write-up in
   `ofa/OFA_WIDTH_RESULTS.md`.
 - KD improvements: `distill/improved_distill.py`, `improved_distill_train.py`.
+- True from-scratch OFA (VOC + COCO): `ofa/voc_ofa_validate.py` — `baselines`,
+  `supernet` and `report` sub-commands; `ofa/prepare_voc.py` for the VOC control.
+  Results: `ofa/out/voc_ofa_results.json`, `ofa/out/coco_ofa_results.json`
+  (+ `coco_base_raw.json`, `coco_sup_raw.json`, `coco_base.log`, `coco_sup_args.txt`).
+  Note `voc_ofa_validate.py --widths` takes **absolute** yolo26 width multipliers
+  and converts them to supernet fractions internally; `set_width()` takes the
+  fraction. Conflating the two invalidated an entire run.
