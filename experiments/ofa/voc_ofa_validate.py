@@ -103,6 +103,21 @@ def official_recipe(ckpt_path: str) -> dict:
     if not ta:
         raise SystemExit(f"{ckpt_path} has no train_args -- cannot derive recipe")
     rec = {k: v for k, v in ta.items() if k not in _NOT_RECIPE and v is not None}
+    # The released checkpoint was trained by a NEWER/forked ultralytics than the
+    # one installed here, and carries hyperparameters this build has no knob for
+    # (MuSGD mixing weights, assigner/loss terms). Passing them raises
+    # "not a valid YOLO argument", so drop them -- but print them, because they
+    # are exactly the fidelity gap between this run and the released model.
+    from ultralytics.cfg import DEFAULT_CFG_DICT
+    dropped = {k: v for k, v in rec.items() if k not in DEFAULT_CFG_DICT}
+    if dropped:
+        print(f"[recipe] WARNING: {len(dropped)} recipe keys unsupported by the "
+              f"installed ultralytics and DROPPED -> this build's defaults apply: "
+              f"{dropped}", flush=True)
+        print("[recipe] the supernet's MAX arm therefore doubles as a fidelity "
+              "check: if it lands near the released mAP, the gap was immaterial.",
+              flush=True)
+        rec = {k: v for k, v in rec.items() if k in DEFAULT_CFG_DICT}
     rec.update(val=False, plots=False)          # we val separately, per-width
     print(f"[recipe] lifted from {ckpt_path}: "
           f"optimizer={rec.get('optimizer')} epochs={rec.get('epochs')} "
