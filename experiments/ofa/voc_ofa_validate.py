@@ -78,6 +78,69 @@ RECIPE = dict(
 )
 
 
+# Keys in a released checkpoint's train_args that describe THAT run rather than
+# the recipe, or that we set ourselves. Everything else is passed through, so the
+# recipe cannot silently drift from what the released model actually used.
+_NOT_RECIPE = {
+    "model", "data", "name", "project", "save_dir", "exist_ok", "device",
+    "resume", "workers", "val", "plots", "save_json", "save_period", "task",
+    "mode", "verbose", "seed", "deterministic", "time", "patience", "fraction",
+    "pretrained", "freeze", "cfg", "source", "distill_model",
+}
+
+
+def official_recipe(ckpt_path: str) -> dict:
+    """Lift the COCO-stage recipe verbatim out of a released yolo26 checkpoint.
+
+    The released models are trained Objects365 -> COCO; `train_args` records the
+    COCO stage. Hand-copying it is how recipes drift, so read it instead. Returns
+    a dict ready to splat into `.train()`, including its own epochs/batch --
+    those ARE part of the official recipe and must not be overridden casually.
+    """
+    import torch as _t
+    ck = _t.load(ckpt_path, map_location="cpu", weights_only=False)
+    ta = dict(ck.get("train_args") or {})
+    if not ta:
+        raise SystemExit(f"{ckpt_path} has no train_args -- cannot derive recipe")
+    rec = {k: v for k, v in ta.items() if k not in _NOT_RECIPE and v is not None}
+    rec.update(val=False, plots=False)          # we val separately, per-width
+    print(f"[recipe] lifted from {ckpt_path}: "
+          f"optimizer={rec.get('optimizer')} epochs={rec.get('epochs')} "
+          f"batch={rec.get('batch')} lr0={rec.get('lr0')} lrf={rec.get('lrf')} "
+          f"nbs={rec.get('nbs')} close_mosaic={rec.get('close_mosaic')}", flush=True)
+    return rec
+
+
+def apply_init(y, init: str) -> None:
+    """Transfer a pretrained checkpoint into a freshly-built model.
+
+    Used to start the supernet from the public Objects365 checkpoint, which is
+    what the official pipeline does. The checkpoint has nc=365 and our cfg has
+    nc=80, so ultralytics' shape-intersecting load drops the classification head
+    and keeps everything else -- exactly the official 365->80 head reinit. We
+    verify the transfer actually happened rather than trusting it: a silent
+    no-match here would look like a from-scratch run wearing an official label.
+    """
+    from ultralytics.utils.torch_utils import intersect_dicts
+    import torch as _t
+    before = {k: v.clone() for k, v in y.model.state_dict().items()}
+    ck = _t.load(init, map_location="cpu", weights_only=False)
+    src = (ck["model"] if isinstance(ck, dict) else ck).float().state_dict()
+    inter = intersect_dicts(src, y.model.state_dict())
+    y.model.load_state_dict(inter, strict=False)
+    changed = sum(1 for k, v in y.model.state_dict().items()
+                  if k in before and not _t.equal(before[k], v))
+    total = len(y.model.state_dict())
+    print(f"[init] {init}: {len(inter)}/{len(src)} src tensors matched by "
+          f"name+shape, {changed}/{total} model tensors changed", flush=True)
+    if changed == 0:
+        raise SystemExit("ABORT: init transferred NOTHING -- this would be a "
+                         "from-scratch run mislabelled as official-pipeline")
+    skipped = [k for k in src if k not in inter]
+    print(f"[init] skipped {len(skipped)} (expect head cls layers, nc 365->80): "
+          f"{skipped[:6]}{' ...' if len(skipped) > 6 else ''}", flush=True)
+
+
 def width_cfg(width: float) -> str:
     """Write a yolo26 yaml whose 's' scale carries the requested width.
 
@@ -151,17 +214,70 @@ def calib_batches(data: str, batch: int, n: int):
     return Stream()
 
 
+def resolve_recipe(a):
+    """Return (train_kwargs, epochs, batch) for this run.
+
+    With --recipe-from, epochs and batch come from the released checkpoint's own
+    train_args unless explicitly overridden on the command line, because they are
+    part of the recipe -- silently keeping our --epochs default of 100 against an
+    official 70-epoch schedule would make the run neither one thing nor the other.
+    """
+    if not a.recipe_from:
+        return dict(RECIPE), a.epochs, a.batch
+    rec = official_recipe(a.recipe_from)
+    ep = rec.pop("epochs", a.epochs)
+    bs = rec.pop("batch", a.batch)
+    if a.epochs_override is not None:
+        print(f"[recipe] epochs {ep} -> {a.epochs_override} (explicit override)", flush=True)
+        ep = a.epochs_override
+    if a.batch_override is not None:
+        print(f"[recipe] batch {bs} -> {a.batch_override} (explicit override)", flush=True)
+        bs = a.batch_override
+    return rec, ep, bs
+
+
+def cmd_released(a):
+    """Evaluate the RELEASED checkpoints as baselines, under our own val call.
+
+    For the official-pipeline experiment the comparison targets are the shipped
+    yolo26s/yolo26n, not anything we train. Re-measuring them here rather than
+    quoting published numbers keeps imgsz, batch, device and val code identical
+    to the sub-net evaluation -- otherwise the tax absorbs a protocol difference.
+    """
+    res = load()
+    res.setdefault("released", {})
+    for spec in a.released:
+        w, path = spec.split("=", 1)
+        print(f"\n=== released baseline {path} (abs width {w}) ===", flush=True)
+        y = YOLO(path)
+        params = sum(p.numel() for p in y.model.parameters()) / 1e6
+        m = y.val(data=a.data, imgsz=640, batch=a.batch, device=a.device,
+                  plots=False, verbose=False)
+        res["released"][str(float(w))] = {
+            "ckpt": path, "params_M": params,
+            "map5095": float(m.box.map), "map50": float(m.box.map50)}
+        print(f"  {path}: {params:.3f}M  mAP50-95={float(m.box.map):.4f} "
+              f"mAP50={float(m.box.map50):.4f}", flush=True)
+        save(res)
+        del y
+        torch.cuda.empty_cache()
+    return 0
+
+
 def cmd_baselines(a):
     res = load()
     res.setdefault("baselines", {})
     for w in a.widths:
         cfg = width_cfg(w)
-        name = f"voc_base_w{w}"
+        name = f"{a.tag}_base_w{w}"
         print(f"\n=== baseline width={w} ({cfg}) ===", flush=True)
         y = YOLO(cfg)
+        if a.init:
+            apply_init(y, a.init)
         params = sum(p.numel() for p in y.model.parameters()) / 1e6
-        y.train(data=a.data, epochs=a.epochs, batch=a.batch, name=name,
-                device=a.device, **RECIPE)
+        rec, ep, bs = resolve_recipe(a)
+        y.train(data=a.data, epochs=ep, batch=bs, name=name,
+                device=a.device, **rec)
         m = y.val(data=a.data, imgsz=640, batch=a.batch, device=a.device,
                   plots=False, verbose=False)
         res["baselines"][str(w)] = {"params_M": params,
@@ -231,17 +347,20 @@ def cmd_supernet(a):
     sup_w = max(a.widths)
     cfg = width_cfg(sup_w)
     fracs = [w / sup_w for w in a.widths]
-    name = "voc_supernet"
+    name = f"{a.tag}_supernet"
     print(f"\n=== supernet at absolute width {sup_w} ({cfg}) ===")
     print(f"    absolute widths {a.widths} -> elastic fractions {fracs}", flush=True)
     y = YOLO(cfg)
+    if a.init:
+        apply_init(y, a.init)
     y.add_callback("on_train_start",
                    lambda tr: patch_sandwich(tr, fracs, a.kd))
     y.add_callback("on_train_epoch_end",
                    lambda tr: tr.ema.ema.load_state_dict(tr.model.state_dict())
                    if getattr(tr, "ema", None) is not None else None)
-    y.train(data=a.data, epochs=a.epochs, batch=a.batch, name=name,
-            device=a.device, **RECIPE)
+    rec, ep, bs = resolve_recipe(a)
+    y.train(data=a.data, epochs=ep, batch=bs, name=name,
+            device=a.device, **rec)
 
     ckpt = sorted(Path("/root/runs/detect").glob(f"{name}*/weights/last.pt"),
                   key=lambda p: p.stat().st_mtime)[-1]
@@ -345,7 +464,7 @@ def cmd_report(a):
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("cmd", choices=["baselines", "supernet", "report"])
+    ap.add_argument("cmd", choices=["baselines", "supernet", "released", "report"])
     ap.add_argument("--data", default="/root/autodl-tmp/VOC/VOC.yaml")
     ap.add_argument("--widths", type=float, nargs="+", default=[0.50, 0.375, 0.25],
                     help="ABSOLUTE yolo26 width multipliers: 0.50=s, 0.25=n")
@@ -356,6 +475,23 @@ def main() -> int:
                     help="results json path; lets the two arms run on separate "
                          "boxes and be merged afterwards")
     ap.add_argument("--device", default="0")
+    ap.add_argument("--init", default=None,
+                    help="pretrained checkpoint to transfer into the freshly-built "
+                         "model (e.g. the public Objects365 yolo26s), matched by "
+                         "name+shape so a differing nc reinitialises the head")
+    ap.add_argument("--recipe-from", default=None,
+                    help="released .pt whose train_args ARE the recipe; brings its "
+                         "own epochs/batch unless --epochs-override/--batch-override")
+    ap.add_argument("--epochs-override", type=int, default=None)
+    ap.add_argument("--batch-override", type=int, default=None)
+    ap.add_argument("--released", nargs="+", default=[],
+                    help="ABSWIDTH=PATH pairs to evaluate as released baselines, "
+                         "e.g. 0.50=/root/yolo26s.pt 0.25=/root/yolo26n.pt")
+    ap.add_argument("--tag", default="voc",
+                    help="run-name prefix, keeps separate experiments from colliding")
+    ap.add_argument("--done-sentinel", default=None,
+                    help="file to touch on success; watch THIS, not a log filename "
+                         "(a notifier once waited on a log path that never existed)")
     a = ap.parse_args()
 
     install_elastic_conv()
@@ -364,8 +500,12 @@ def main() -> int:
         global RESULTS
         RESULTS = Path(a.results)
     a.widths = sorted(a.widths, reverse=True)
-    return {"baselines": cmd_baselines, "supernet": cmd_supernet,
-            "report": cmd_report}[a.cmd](a)
+    rc = {"baselines": cmd_baselines, "supernet": cmd_supernet,
+          "released": cmd_released, "report": cmd_report}[a.cmd](a)
+    if rc == 0 and a.done_sentinel:
+        pathlib.Path(a.done_sentinel).write_text(f"{a.cmd} ok\n")
+        print(f"[done] wrote sentinel {a.done_sentinel}", flush=True)
+    return rc
 
 
 if __name__ == "__main__":
