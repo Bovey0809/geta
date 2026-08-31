@@ -130,31 +130,59 @@ def official_recipe(ckpt_path: str) -> dict:
 def apply_init(y, init: str) -> None:
     """Transfer a pretrained checkpoint into a freshly-built model.
 
-    Used to start the supernet from the public Objects365 checkpoint, which is
-    what the official pipeline does. The checkpoint has nc=365 and our cfg has
-    nc=80, so ultralytics' shape-intersecting load drops the classification head
-    and keeps everything else -- exactly the official 365->80 head reinit. We
-    verify the transfer actually happened rather than trusting it: a silent
-    no-match here would look like a from-scratch run wearing an official label.
+    MUST go through ultralytics' own `YOLO.load()`, not a hand-rolled
+    `load_state_dict` into `y.model`. `Model.train()` does
+
+        self.trainer.model = self.trainer.get_model(
+            weights=self.model if self.ckpt else None, cfg=self.model.yaml)
+
+    and `YOLO(<yaml>)` leaves `self.ckpt` empty, so hand-loading into `y.model`
+    is silently discarded: the trainer rebuilds from the yaml. `YOLO.load()` sets
+    `self.ckpt`, which is what makes the weights survive into training.
+
+    This cost a 19.6-hour run. The old guard checked that `y.model`'s tensors
+    changed -- they did -- but `y.model` was the object being thrown away. The
+    lesson is the study's recurring one: verify the object that is actually USED,
+    not the one you just touched.
     """
-    from ultralytics.utils.torch_utils import intersect_dicts
+    y.load(init)
+    if not y.ckpt:
+        raise SystemExit(
+            f"ABORT: YOLO.load({init}) did not populate .ckpt, so Model.train() "
+            "would discard these weights and train from random init.")
+    print(f"[init] loaded {init} via YOLO.load(); y.ckpt populated "
+          f"-> weights will survive into the trainer", flush=True)
+
+
+def install_init_verifier(y, init: str) -> None:
+    """Assert at train start that the TRAINER's model really carries the init.
+
+    Belt and braces for the failure above: compares the first backbone conv in
+    `trainer.model` against the same tensor in the checkpoint on disk. Backbone
+    tensors must match exactly; only the head may differ (nc 365 -> 80).
+    """
     import torch as _t
-    before = {k: v.clone() for k, v in y.model.state_dict().items()}
-    ck = _t.load(init, map_location="cpu", weights_only=False)
-    src = (ck["model"] if isinstance(ck, dict) else ck).float().state_dict()
-    inter = intersect_dicts(src, y.model.state_dict())
-    y.model.load_state_dict(inter, strict=False)
-    changed = sum(1 for k, v in y.model.state_dict().items()
-                  if k in before and not _t.equal(before[k], v))
-    total = len(y.model.state_dict())
-    print(f"[init] {init}: {len(inter)}/{len(src)} src tensors matched by "
-          f"name+shape, {changed}/{total} model tensors changed", flush=True)
-    if changed == 0:
-        raise SystemExit("ABORT: init transferred NOTHING -- this would be a "
-                         "from-scratch run mislabelled as official-pipeline")
-    skipped = [k for k in src if k not in inter]
-    print(f"[init] skipped {len(skipped)} (expect head cls layers, nc 365->80): "
-          f"{skipped[:6]}{' ...' if len(skipped) > 6 else ''}", flush=True)
+
+    def _check(trainer):
+        ck = _t.load(init, map_location="cpu", weights_only=False)
+        src = (ck["model"] if isinstance(ck, dict) else ck).float().state_dict()
+        got = trainer.model.state_dict()
+        key = next((k for k in src if k.endswith("conv.weight") and k in got
+                    and got[k].shape == src[k].shape), None)
+        if key is None:
+            raise SystemExit("ABORT: no comparable backbone tensor; cannot verify init")
+        same = _t.allclose(got[key].float().cpu(), src[key].float().cpu(), atol=1e-6)
+        n_match = sum(1 for k in src if k in got and got[k].shape == src[k].shape
+                      and _t.allclose(got[k].float().cpu(), src[k].float().cpu(), atol=1e-6))
+        print(f"[init-verify] trainer.model vs {init}: '{key}' identical={same}; "
+              f"{n_match}/{len(src)} src tensors identical", flush=True)
+        if not same:
+            raise SystemExit(
+                "ABORT: the trainer's model does NOT carry the init weights. "
+                "This is the bug that made a 19.6-hour run train from random "
+                "init while reporting a successful transfer.")
+
+    y.add_callback("on_train_start", _check)
 
 
 def width_cfg(width: float) -> str:
@@ -260,6 +288,14 @@ def resolve_recipe(a):
     if a.batch_override is not None:
         print(f"[recipe] batch {bs} -> {a.batch_override} (explicit override)", flush=True)
         bs = a.batch_override
+    for kv in getattr(a, "set", None) or []:
+        k, _, v = kv.partition("=")
+        try:
+            v = float(v) if ("." in v or "e" in v.lower()) else int(v)
+        except ValueError:
+            v = {"true": True, "false": False}.get(v.lower(), v)
+        print(f"[recipe] override {k}: {rec.get(k)} -> {v}", flush=True)
+        rec[k] = v
     return rec, ep, bs
 
 
@@ -301,6 +337,7 @@ def cmd_baselines(a):
         y = YOLO(cfg)
         if a.init:
             apply_init(y, a.init)
+            install_init_verifier(y, a.init)
         params = sum(p.numel() for p in y.model.parameters()) / 1e6
         rec, ep, bs = resolve_recipe(a)
         y.train(data=a.data, epochs=ep, batch=bs, name=name,
@@ -380,6 +417,7 @@ def cmd_supernet(a):
     y = YOLO(cfg)
     if a.init:
         apply_init(y, a.init)
+        install_init_verifier(y, a.init)
     y.add_callback("on_train_start",
                    lambda tr: patch_sandwich(tr, fracs, a.kd))
     y.add_callback("on_train_epoch_end",
@@ -570,6 +608,10 @@ def main() -> int:
                          "e.g. 0.50=/root/yolo26s.pt 0.25=/root/yolo26n.pt")
     ap.add_argument("--ckpt", default=None,
                     help="trained supernet checkpoint, for `evalsupernet`")
+    ap.add_argument("--set", nargs="+", default=None, metavar="KEY=VAL",
+                    help="override individual recipe keys, e.g. --set lr0=0.0019 "
+                         "cls=1.74 . Used to probe which part of the official "
+                         "recipe the public build is missing")
     ap.add_argument("--track-val", action="store_true",
                     help="validate every epoch so a long run is observable while "
                          "it is still running, instead of only at the end")
