@@ -1,4 +1,6 @@
 {
+  "INVALID": "RETRACTED. The supernet in this file trained from RANDOM INIT, not from the Objects365 checkpoint. apply_init() loaded the weights into y.model, but Model.train() rebuilds from the yaml unless y.ckpt is set, so they were discarded. The run was a from-scratch model trained 70 epochs at lr0=0.00038 -- a fine-tuning learning rate -- which is why the max arm scored 0.2375 instead of the released 0.4714. Detected because an 'O365 init' run and a random-init run gave an identical epoch-1 mAP of 0.000332. Do NOT quote the supernet numbers below. The 'released' block IS valid: those are measurements of the shipped checkpoints.",
+  "superseded_by": "official2_*.json (corrected init, verified at train start)",
   "released": {
     "0.5": {
       "ckpt": "/root/yolo26s.pt",
