@@ -1,0 +1,5 @@
+=== eval-only: /home/rick/geta_ofa/official_supernet_last.pt ===
+    absolute widths [0.5, 0.375, 0.25] -> elastic fractions [1.0, 0.75, 0.5]
+  supernet abs_w=0.5 (frac 1.000): 10.010M mAP50-95=0.2375
+  supernet abs_w=0.375 (frac 0.750): 5.880M mAP50-95=0.2275
+  supernet abs_w=0.25 (frac 0.500): 2.874M mAP50-95=0.1945
