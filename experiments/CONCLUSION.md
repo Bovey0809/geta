@@ -2,9 +2,81 @@
 
 **Goal:** shrink Ultralytics YOLO26 (fewer params / FLOPs) while holding COCO mAP50-95,
 via GETA structured pruning and, later, Once-for-All (OFA) elastic sub-networks.
-**Answer (as of the pruning + KD work): no via structured pruning — yolo26 has little
-redundant capacity to remove, and post-hoc KD of a right-sized student doesn't beat its
-own baseline.** You are consistently better off picking the right-sized default model.
+
+## Conclusion (2026-08-31)
+**No.** Nothing tested here produced a yolo26 variant that is simultaneously
+smaller than a stock model *and* better than it. If you want a smaller yolo26,
+pick the smaller stock model.
+
+**The one genuine "faster at the same mAP" is not a compression method at all:**
+TensorRT FP16 on the dense model — **−37 to −41 % GPU latency, no mAP change**
+(`geta_yolo26/FINDINGS.md` §8). INT8 QDQ is both slower *and* lossy for yolo26,
+because attention / concat / the NMS-free head don't INT8-fuse.
+
+| route | outcome | verdict |
+|---|---|---|
+| GETA structured pruning (P1) | 0.450 at m's param count vs m's 0.518 | dead end — deletes capacity yolo26 actually uses |
+| KD x→m (P4) | CWD channel-wise KL beats stock score-weighted L2 | a real method gain and an upstream candidate, but regime-specific and still below the right-sized baseline |
+| intermediate width 0.375 (P5) | 5.655 M → 0.3863 | Pareto-**dominated** by yolo26n (2.572 M → 0.395) |
+| OFA supernet, done correctly (P6, P7) | tax +0.003 … +0.018 (2–4 % relative) | the machinery works — but it buys logistics, not a Pareto win |
+
+**What OFA is actually worth.** One training run yields three deployable
+operating points, each within ~2–4 % relative mAP of a model trained alone at
+that width. That is a real engineering benefit. It is **not** a smaller-and-better
+model: the sub-net never beats its own baseline at any width, and the small
+sub-net stays far below the large one (2.874 M → 0.3439 vs 10.010 M → 0.4069).
+
+**Retracted along the way:** the claim that yolo26-on-COCO has no redundant
+capacity for OFA. Same dataset, same architecture, same width fraction — post-hoc
+elasticity on a converged checkpoint scored **0.0000**, while a supernet trained
+*as* a supernet from scratch scored **0.3439**. The protocol was the problem, not
+the capacity (P7).
+
+### Not concluded
+The OFA tax at **official convergence** — against Objects365→COCO-strength
+baselines — has **not been measured**. Paradigm 8's first attempt is retracted for
+training from random init, and the corrected runs are only a few epochs in. No
+number for it should be quoted yet.
+
+### The methodological result, which may outlast the empirical one
+**Four** of this study's conclusions were measurement artefacts rather than
+findings: two BN-recalibration failures (P2, P3), one post-hoc-elasticity protocol
+error (P7), and one discarded initialisation (P8). Every one produced a *plausible*
+number that survived scrutiny because the guard checked the wrong object — the
+last reported "696/708 tensors transferred" while the trainer discarded all 696.
+
+The practices that actually caught them are the transferable output:
+* recalibrate BN **per configuration** before scoring any sub-net — and
+  recalibrate the reference the same way, or the comparison carries a
+  damage-profile confound;
+* train elastic **from scratch**; never apply elasticity post-hoc and read the
+  result as a statement about capacity;
+* verify weights **inside the trainer**, not on the object you just loaded into;
+* **pre-register** the decision rule before the results exist;
+* cheapest detector of the whole class: run one config from **two different
+  inits** — identical metrics mean one init never reached training.
+
+
+Hardware: single **RTX PRO 6000 Blackwell 96 GB** (final runs); earlier work on RTX 3080 Ti 12 GB.
+COCO val2017, mAP50-95, imgsz 640.
+
+## YOLO26 default baselines (this study)
+| model | params | mAP50-95 |
+|---|---|---|
+| yolo26n | 2.6 M | 0.395 |
+| yolo26s | 9.5 M | 0.472 |
+| yolo26m | 20.4 M | 0.518 |
+| yolo26l | 24.8 M | 0.5375 |
+| yolo26x | 59.0 M | 0.5626 |
+
+*Params here are the **fused** counts ultralytics prints at val. Paradigms 7–8 quote
+**unfused** counts from the training graph (yolo26s = 10.010 M, not 9.5 M), because
+that is what the elastic slicing operates on. Same models, different counting.*
+
+## Revision history — superseded readings (kept for provenance)
+These were the standing interpretations at the dates shown. Both are
+superseded by Paradigm 7 and the Conclusion above, and are retained because
+they record real measurements that Paradigm 3 cites.
 
 > **RESOLVED (2026-08-23) — width-elastic OFA rebuilt correctly, and it still
 > does not produce a Pareto win.** The 2026-08-20 retraction stands on its facts:
@@ -42,18 +114,6 @@ own baseline.** You are consistently better off picking the right-sized default 
 > blockquote above — was measured **post-hoc on an already-converged checkpoint**.
 > That protocol, not yolo26's capacity, is what produced the dead widths. The Pareto
 > verdict is unchanged: OFA still never beats a dedicated model at the same width.
-
-Hardware: single **RTX PRO 6000 Blackwell 96 GB** (final runs); earlier work on RTX 3080 Ti 12 GB.
-COCO val2017, mAP50-95, imgsz 640.
-
-## YOLO26 default baselines (this study)
-| model | params | mAP50-95 |
-|---|---|---|
-| yolo26n | 2.6 M | 0.395 |
-| yolo26s | 9.5 M | 0.472 |
-| yolo26m | 20.4 M | 0.518 |
-| yolo26l | 24.8 M | 0.5375 |
-| yolo26x | 59.0 M | 0.5626 |
 
 ## Paradigm 1 — GETA structured pruning (dead end)
 Headline attempt "pruned-x beats default-L": prune yolo26x to below L's params, fine-tune
@@ -448,7 +508,10 @@ needs 85.5 GB at batch 128, so the matched pair runs at batch 96.
 Pre-registered decision rule, written before any of these results existed:
 `ofa/out/official_ofa_PREREGISTERED.md`.
 
-## Unified conclusion (revised 2026-08-31)
+## Unified conclusion — full reasoning (revised 2026-08-31)
+*The short version is the Conclusion at the top of this file; this section keeps
+the detailed argument and the standing retractions.*
+
 **What holds:** structured pruning deletes capacity YOLO26 actually uses and a
 50-epoch full-COCO fine-tune recovers only ~80 % of dense-x (0.450 at default-m's
 param count vs m's 0.518). Post-hoc KD-fine-tuning of a right-sized student
