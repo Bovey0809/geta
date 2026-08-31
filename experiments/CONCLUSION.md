@@ -365,7 +365,90 @@ Data: `ofa/out/coco_ofa_results.json` (merged, with the size-matched correction)
 raw arms in `ofa/out/coco_base_raw.json` and `ofa/out/coco_sup_raw.json`; baseline
 log in `ofa/out/coco_base.log`; supernet trainer args in `ofa/out/coco_sup_args.txt`.
 
-## Unified conclusion (revised 2026-08-29)
+## Paradigm 8 — the OFA tax at OFFICIAL convergence (first attempt RETRACTED; rerun in flight)
+Paradigm 7 showed from-scratch OFA on COCO works, but its baselines topped out at
+0.4247 against the released yolo26s's 0.4714. It therefore could not answer the
+question that matters for deployment: does the tax survive when the baseline is
+genuinely strong?
+
+**The design writes itself.** The released `yolo26s.pt`'s own `train_args` record
+`model = yolo26s-objv1-150.pt` — the shipped model *is* the public Objects365
+checkpoint plus a 70-epoch COCO stage. So reproduce that pipeline and change
+exactly one thing: leave elasticity on for the whole COCO stage. The supernet's
+max arm then doubles as a reproduction check of the official pipeline.
+
+Released checkpoints, re-measured under our own val call so no protocol
+difference leaks into the tax (published values in brackets):
+
+| model | params | measured | published |
+|---|---|---|---|
+| yolo26s | 10.010 M | **0.4714** | 0.472 |
+| yolo26n | 2.572 M | **0.3949** | 0.395 |
+
+### First attempt — RETRACTED (it trained from random init)
+19.6 hours of training produced a max arm of **0.2375** against 0.4714. The cause
+was neither elasticity nor the recipe. `apply_init()` loaded the checkpoint into
+`y.model`, but ultralytics runs
+
+```python
+self.trainer.model = self.trainer.get_model(
+    weights=self.model if self.ckpt else None, cfg=self.model.yaml)
+```
+
+and `YOLO(<yaml>)` leaves `self.ckpt` empty, so **the trainer rebuilt the model
+from the yaml and discarded the loaded weights.** The run was a from-scratch
+model trained 70 epochs at `lr0=0.00038` — a *fine-tuning* learning rate — which
+explains 0.2375 exactly.
+
+It surfaced only because two probes, one from the Objects365 init and one from
+random init, returned an **identical epoch-1 mAP of 0.000332**. Six matching
+significant figures is not a coincidence. Data:
+`ofa/out/official_ofa_results_INVALID.json`.
+
+Two claims die with it: that the 9 recipe keys public ultralytics cannot express
+explained the shortfall, and that the missing `cls_w` multiplier was the
+mechanism — the latter independently refuted by a probe that raised `cls` and
+watched mAP collapse to 0.019.
+
+**What it teaches.** The guard reported "696/708 tensors transferred" and was
+worthless: it verified `y.model`, the object being thrown away. Every retraction
+in this study has that same shape — **verify the object that is actually USED,
+not the one you just touched.** The replacement asserts at *train start* that
+`trainer.model` is bit-identical to the checkpoint on disk. A cheap detector for
+the whole class: run one config from two different inits; identical metrics mean
+one init never reached training.
+
+### Corrected runs — PARTIAL, NOT A RESULT YET
+Init now verified in the trainer (`696/708 src tensors identical`). Epoch 1 scores
+**0.278**, already better after one epoch than the broken run reached in seventy.
+
+Matched-epoch elastic vs non-elastic (identical init, recipe, batch and epochs):
+
+| epoch | non-elastic | supernet | gap |
+|---|---|---|---|
+| 1 | 0.278 | 0.159 | +0.1190 |
+| 2 | 0.368 | 0.341 | +0.0270 |
+| 3 | 0.388 | 0.368 | +0.0200 |
+
+**These are epochs 3–6 of 70 and must not be quoted as the tax.** The direction is
+the expected one — the supernet starts behind, because it splits capacity three
+ways, and closes quickly — but a 3-epoch gap is not a converged gap. The
+non-elastic arm is at 0.414 by epoch 6 against the released 0.4714, so the
+filtered recipe does look able to approach the released model, which would mean
+those 9 unsupported keys are immaterial after all.
+
+Three arms are training: `fixed_nonelastic` (batch 96) and `fixed_supernet`
+(batch 96) form the matched pair, and `fidelity_b128` runs non-elastic at the
+official batch 128. The headline will be
+`fixed_nonelastic − fixed_supernet@1.0`, which shares init, recipe, batch and
+epochs and so isolates the cost of elasticity from both the recipe gap and the
+batch deviation. Deviation on record: the RTX 6000D has 85.6 GB and the sandwich
+needs 85.5 GB at batch 128, so the matched pair runs at batch 96.
+
+Pre-registered decision rule, written before any of these results existed:
+`ofa/out/official_ofa_PREREGISTERED.md`.
+
+## Unified conclusion (revised 2026-08-31)
 **What holds:** structured pruning deletes capacity YOLO26 actually uses and a
 50-epoch full-COCO fine-tune recovers only ~80 % of dense-x (0.450 at default-m's
 param count vs m's 0.518). Post-hoc KD-fine-tuning of a right-sized student
@@ -393,7 +476,21 @@ simultaneously smaller than a default *and* better than it.
 **Limits of the retraction.** Paradigm 7 matches its two arms to each other, not to
 the released models: 100 epochs, random init, no Objects365. It establishes that the
 elastic failures were procedural. It does **not** establish that the 2–4 % tax
-survives at official convergence, where the baselines are considerably stronger.
+survives at official convergence — that is Paradigm 8, which is **still running**.
+Its first attempt was retracted for training from random init, and the corrected
+runs are only a few epochs in. **No tax at official convergence has been measured
+yet**, and the early matched-epoch gap (+0.020 at epoch 3, narrowing) is a
+direction, not a number.
+
+**The methodological result may outlast the empirical one.** Four separate
+conclusions in this study were measurement artefacts, not findings: two BN
+recalibration failures, one post-hoc-elasticity protocol error, and one discarded
+initialisation. Every one produced a *plausible* number that survived review
+because the guard checked the wrong object. The practices that actually caught
+them — per-configuration BN recalibration, training elastic from scratch rather
+than post-hoc, verifying weights inside the trainer, pre-registering the decision
+rule, and re-running one config from two inits to see if the metrics move — are
+the transferable output of this work.
 
 The one method improvement that survived controlled testing: **CWD channel-wise KL
 beats the stock score-weighted L2 in Ultralytics' distillation loss** (upstream
