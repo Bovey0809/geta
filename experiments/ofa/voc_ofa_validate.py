@@ -377,13 +377,55 @@ def cmd_supernet(a):
     y.train(data=a.data, epochs=ep, batch=bs, name=name,
             device=a.device, **rec)
 
-    ckpt = sorted(Path("/root/runs/detect").glob(f"{name}*/weights/last.pt"),
-                  key=lambda p: p.stat().st_mtime)[-1]
-    print(f"supernet ckpt: {ckpt}", flush=True)
+    ckpt = resolve_ckpt(y, name)
+    return eval_supernet(a, ckpt, a.widths, fracs, res)
 
+
+def resolve_ckpt(y, name):
+    """Locate the checkpoint the trainer just wrote.
+
+    ASK THE TRAINER; do not guess. This previously globbed a hardcoded
+    /root/runs/detect, but ultralytics' `runs_dir` setting is the RELATIVE path
+    "runs", so the save location follows the CURRENT WORKING DIRECTORY. Launching
+    from /root/geta/experiments/ofa sent the run to
+    /root/geta/experiments/ofa/runs/detect/... and the glob found nothing --
+    an IndexError that destroyed the eval phase of a 19.6-hour training run.
+    """
+    tr = getattr(y, "trainer", None)
+    cand = []
+    if tr is not None and getattr(tr, "save_dir", None):
+        cand.append(Path(tr.save_dir) / "weights" / "last.pt")
+        if getattr(tr, "last", None):
+            cand.insert(0, Path(tr.last))
+    for c in cand:
+        if c.exists():
+            print(f"supernet ckpt (from trainer.save_dir): {c}", flush=True)
+            return c
+    # last resort: search both plausible roots rather than one hardcoded guess
+    roots = [Path("/root/runs/detect"), Path.cwd() / "runs" / "detect",
+             Path(__file__).resolve().parent / "runs" / "detect"]
+    hits = [q for r in roots for q in r.glob(f"{name}*/weights/last.pt")]
+    if not hits:
+        raise SystemExit(
+            f"ABORT: no checkpoint for run '{name}'. Searched: "
+            + ", ".join(str(r) for r in roots)
+            + ". The weights are NOT lost -- find them with "
+              "`find / -name last.pt -newer <something>` and re-run with "
+              "`evalsupernet --ckpt <path>` to skip retraining.")
+    best = max(hits, key=lambda q: q.stat().st_mtime)
+    print(f"supernet ckpt (fallback search): {best}", flush=True)
+    return best
+
+
+def eval_supernet(a, ckpt, widths, fracs, res):
+    """BN-recalibrate and evaluate every sub-net of a trained supernet.
+
+    Separated from training so a finished supernet can be re-evaluated without
+    burning another 20 GPU-hours when only the eval phase fails.
+    """
     calib = calib_batches(a.data, a.batch, 100)
     res.setdefault("supernet", {})
-    for w, f in zip(a.widths, fracs):
+    for w, f in zip(widths, fracs):
         yq = YOLO(str(ckpt))
         mm = yq.model.to(f"cuda:{a.device}")
         plan_model(mm)
@@ -405,6 +447,17 @@ def cmd_supernet(a):
         del yq, mm
         torch.cuda.empty_cache()
     return 0
+
+
+def cmd_evalsupernet(a):
+    """Evaluate an ALREADY-TRAINED supernet checkpoint. No training."""
+    if not a.ckpt:
+        raise SystemExit("evalsupernet needs --ckpt <path to supernet last.pt>")
+    sup_w = max(a.widths)
+    fracs = [w / sup_w for w in a.widths]
+    print(f"=== eval-only: {a.ckpt} ===")
+    print(f"    absolute widths {a.widths} -> elastic fractions {fracs}", flush=True)
+    return eval_supernet(a, Path(a.ckpt), a.widths, fracs, load())
 
 
 def cmd_report(a):
@@ -479,7 +532,8 @@ def cmd_report(a):
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("cmd", choices=["baselines", "supernet", "released", "report"])
+    ap.add_argument("cmd", choices=["baselines", "supernet", "released",
+                                    "evalsupernet", "report"])
     ap.add_argument("--data", default="/root/autodl-tmp/VOC/VOC.yaml")
     ap.add_argument("--widths", type=float, nargs="+", default=[0.50, 0.375, 0.25],
                     help="ABSOLUTE yolo26 width multipliers: 0.50=s, 0.25=n")
@@ -502,6 +556,8 @@ def main() -> int:
     ap.add_argument("--released", nargs="+", default=[],
                     help="ABSWIDTH=PATH pairs to evaluate as released baselines, "
                          "e.g. 0.50=/root/yolo26s.pt 0.25=/root/yolo26n.pt")
+    ap.add_argument("--ckpt", default=None,
+                    help="trained supernet checkpoint, for `evalsupernet`")
     ap.add_argument("--tag", default="voc",
                     help="run-name prefix, keeps separate experiments from colliding")
     ap.add_argument("--done-sentinel", default=None,
@@ -516,7 +572,8 @@ def main() -> int:
         RESULTS = Path(a.results)
     a.widths = sorted(a.widths, reverse=True)
     rc = {"baselines": cmd_baselines, "supernet": cmd_supernet,
-          "released": cmd_released, "report": cmd_report}[a.cmd](a)
+          "released": cmd_released, "evalsupernet": cmd_evalsupernet,
+          "report": cmd_report}[a.cmd](a)
     if rc == 0 and a.done_sentinel:
         pathlib.Path(a.done_sentinel).write_text(f"{a.cmd} ok\n")
         print(f"[done] wrote sentinel {a.done_sentinel}", flush=True)
