@@ -40,6 +40,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import os
 import json
 import sys
 import pathlib
@@ -176,8 +177,11 @@ def width_cfg(width: float) -> str:
     base["scales"] = dict(base["scales"])
     base["scales"]["s"] = [0.50, float(width), 1024]
     tag = f"w{int(round(width * 1000)):04d}"
-    out_dir = Path("/root/voc_cfgs")
-    out_dir.mkdir(exist_ok=True)
+    # NOT hardcoded /root: these experiments also run on shared boxes where the
+    # user is not root. Same class of bug as the hardcoded checkpoint glob that
+    # destroyed the eval phase of a 19.6-hour run.
+    out_dir = Path(os.environ.get("OFA_CFG_DIR", Path.home() / ".ofa_cfgs"))
+    out_dir.mkdir(parents=True, exist_ok=True)
     shared = out_dir / f"yolo26-{tag}.yaml"
     _y.safe_dump(base, open(shared, "w"), sort_keys=False)
     handle = out_dir / f"yolo26s-{tag}.yaml"
@@ -238,8 +242,16 @@ def resolve_recipe(a):
     official 70-epoch schedule would make the run neither one thing nor the other.
     """
     if not a.recipe_from:
-        return dict(RECIPE), a.epochs, a.batch
+        rec = dict(RECIPE)
+        if getattr(a, "track_val", False):
+            rec["val"] = True
+        return rec, a.epochs, a.batch
     rec = official_recipe(a.recipe_from)
+    if getattr(a, "track_val", False):
+        # Per-epoch val. The 70-epoch supernet ran with val=False and gave no
+        # signal at all for 19.6 hours -- we only learned it had underperformed
+        # after it had finished. Cheap insurance on any long run.
+        rec["val"] = True
     ep = rec.pop("epochs", a.epochs)
     bs = rec.pop("batch", a.batch)
     if a.epochs_override is not None:
@@ -558,6 +570,9 @@ def main() -> int:
                          "e.g. 0.50=/root/yolo26s.pt 0.25=/root/yolo26n.pt")
     ap.add_argument("--ckpt", default=None,
                     help="trained supernet checkpoint, for `evalsupernet`")
+    ap.add_argument("--track-val", action="store_true",
+                    help="validate every epoch so a long run is observable while "
+                         "it is still running, instead of only at the end")
     ap.add_argument("--tag", default="voc",
                     help="run-name prefix, keeps separate experiments from colliding")
     ap.add_argument("--done-sentinel", default=None,
