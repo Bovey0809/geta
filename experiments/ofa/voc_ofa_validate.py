@@ -473,7 +473,7 @@ def eval_supernet(a, ckpt, widths, fracs, res):
     Separated from training so a finished supernet can be re-evaluated without
     burning another 20 GPU-hours when only the eval phase fails.
     """
-    calib = calib_batches(a.data, a.batch, 100)
+    calib = calib_batches(a.data, a.batch, getattr(a, 'calib_batches', None) or 100)
     res.setdefault("supernet", {})
     for w, f in zip(widths, fracs):
         yq = YOLO(str(ckpt))
@@ -612,6 +612,10 @@ def main() -> int:
                     help="override individual recipe keys, e.g. --set lr0=0.0019 "
                          "cls=1.74 . Used to probe which part of the official "
                          "recipe the public build is missing")
+    ap.add_argument("--calib-batches", type=int, default=100,
+                    help="batches used for per-width BN recalibration. The tax "
+                         "must not be sensitive to this; if it is, the recal is "
+                         "under-budgeted and the sub-net scores are pessimistic")
     ap.add_argument("--track-val", action="store_true",
                     help="validate every epoch so a long run is observable while "
                          "it is still running, instead of only at the end")
